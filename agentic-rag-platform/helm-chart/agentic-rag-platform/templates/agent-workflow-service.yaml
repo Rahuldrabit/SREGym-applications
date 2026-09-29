@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-workflow
+  labels:
+    app: agent-workflow
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.agentWorkflow.port }}
+      targetPort: {{ .Values.agentWorkflow.port }}
+      protocol: TCP
+      name: http
+  selector:
+    app: agent-workflow

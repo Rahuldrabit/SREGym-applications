@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-workflow
+  labels:
+    app: agent-workflow
+spec:
+  replicas: {{ .Values.agentWorkflow.replicaCount }}
+  selector:
+    matchLabels:
+      app: agent-workflow
+  template:
+    metadata:
+      labels:
+        app: agent-workflow
+    spec:
+      containers:
+        - name: agent-workflow
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "/app/agent-workflow/agent-workflow-app.py"]
+          ports:
+            - containerPort: {{ .Values.agentWorkflow.port }}
+          env:
+            - name: PORT
+              value: "{{ .Values.agentWorkflow.port }}"
+            - name: PLANNER_MAX_RETRIES
+              value: "{{ .Values.agentWorkflow.maxRetries }}"
+            - name: PLANNER_TIMEOUT
+              value: "{{ .Values.agentWorkflow.timeout }}"
+            - name: TOOL_SERVICE_URL
+              value: "{{ .Values.agentWorkflow.toolServiceUrl }}"
+          volumeMounts:
+            - name: code-volume
+              mountPath: /app/agent-workflow
+      volumes:
+        - name: code-volume
+          configMap:
+            name: agentic-rag-scripts

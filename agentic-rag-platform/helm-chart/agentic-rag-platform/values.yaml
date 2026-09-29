@@ -1,0 +1,28 @@
+namespace: agentic-rag-platform
+
+image:
+  repository: python
+  tag: "3.11-slim"
+  pullPolicy: IfNotPresent
+
+backend:
+  replicaCount: 1
+  port: 8002
+  concurrencyLimit: 25
+  normalLatency: 0.25
+  faultLatency: 1.5
+  queueCapacity: 50
+
+toolService:
+  replicaCount: 1
+  port: 8001
+  maxRetries: 2
+  timeout: 1.4
+  backendUrl: "http://backend:8002/query"
+
+agentWorkflow:
+  replicaCount: 1
+  port: 8000
+  maxRetries: 3
+  timeout: 3.5
+  toolServiceUrl: "http://tool-service:8001/tools/retrieve"
