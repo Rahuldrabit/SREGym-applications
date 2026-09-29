@@ -1,59 +1,87 @@
-namespace: agentic-retry-platform
+# Default values for agentic-retry-platform.
 
 image:
   repository: python
-  tag: "3.11-slim"
   pullPolicy: IfNotPresent
+  tag: "3.11-slim"
 
-redis:
-  image:
-    repository: redis
-    tag: "7-alpine"
-    pullPolicy: IfNotPresent
-  port: 6379
+agentOrchestrator:
+  replicaCount: 2
+  port: 8000
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
 
-postgres:
-  image:
-    repository: postgres
-    tag: "15-alpine"
-    pullPolicy: IfNotPresent
-  port: 5432
-  db: knowledge
-  user: agent_user
-  password: agent_password
-
-pgbouncer:
-  image:
-    repository: edoburu/pgbouncer
-    tag: "v1.20.1"
-    pullPolicy: IfNotPresent
-  port: 6432
-  poolSize: 25
-  maxClientConn: 200
+toolGateway:
+  replicaCount: 2
+  port: 8001
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
 
 dataApi:
-  replicaCount: 2
+  replicaCount: 1
   port: 8002
   concurrencyLimit: 25
   queueCapacity: 200
   normalLatency: 0.10
   faultLatency: 1.50
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
 
-toolGateway:
-  replicaCount: 2
-  port: 8001
-  httpTimeout: 0.60
-  httpMaxRetries: 2
-  toolMaxRetries: 2
-  dataApiUrl: "http://data-api:8002/data/query"
+redis:
+  image:
+    repository: redis
+    pullPolicy: IfNotPresent
+    tag: "7.2-alpine"
+  port: 6379
 
-agentOrchestrator:
-  replicaCount: 2
-  port: 8000
-  plannerTimeout: 3.50
-  plannerMaxRetries: 3
-  workflowDeadline: 12.0
-  retryBudget: 12
-  toolGatewayUrl: "http://tool-gateway:8001/tools/execute"
-  redisHost: "redis"
-  redisPort: 6379
+postgres:
+  image:
+    repository: postgres
+    pullPolicy: IfNotPresent
+    tag: "16-alpine"
+  port: 5432
+  db: agentic_db
+  user: postgres
+  password: postgres
+
+pgbouncer:
+  image:
+    repository: edoburu/pgbouncer
+    pullPolicy: IfNotPresent
+    tag: "v1.22.0"
+  port: 6432
+  poolMode: transaction
+  defaultPoolSize: 25
+  maxClientConn: 200
+
+# Canonical single source of truth for runtime agentic retry policy
+policy:
+  workflow:
+    timeoutMs: 1500
+    maxAttempts: 3
+    maxInflight: 100
+    cancelChildrenOnTimeout: false
+  tool:
+    timeoutMs: 1000
+    maxAttempts: 2
+  transport:
+    timeoutMs: 600
+    maxAttempts: 2
+  retryBudget:
+    enabled: false
+    maxPhysicalAttemptsPerWorkflow: 4

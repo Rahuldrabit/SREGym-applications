@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Agent Orchestrator Service for Agentic Retry Platform.
 
-Acts as autonomous agent supervisor. Coordinates multi-stage tool execution,
-manages workflow generations, handles speculative replanning upon planner timeout,
-implements uncancelled orphaned work mechanics vs cancellation propagation,
-enforces global retry budgets, and tracks durable queue leases.
+Coordinates multi-stage tool execution, manages workflow generations,
+handles speculative replanning upon planner timeout, implements uncancelled
+orphaned work mechanics vs cancellation propagation, connects to Redis for durable
+workflow tracking, and tracks retry budgets.
 """
 
 from __future__ import annotations
@@ -12,12 +12,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import sys
 import threading
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,6 +33,69 @@ TOOL_GATEWAY_CANCEL_URL = os.environ.get("TOOL_GATEWAY_CANCEL_URL", "http://tool
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 POLICY_PATH = os.environ.get("POLICY_PATH", "/etc/agent-policy/policy.json")
+
+
+class RedisClient:
+    """Pure-Python RESP client with zero external dependencies."""
+
+    def __init__(self, host: str, port: int, timeout: float = 1.0):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+
+    def execute(self, *args) -> Any:
+        try:
+            with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
+                req = f"*{len(args)}\r\n"
+                for arg in args:
+                    s = str(arg)
+                    req += f"${len(s.encode('utf-8'))}\r\n{s}\r\n"
+                sock.sendall(req.encode("utf-8"))
+
+                f = sock.makefile("rb")
+                line = f.readline()
+                if not line:
+                    return None
+                prefix = line[:1]
+                if prefix in (b"+", b"-"):
+                    return line[1:-2].decode("utf-8")
+                elif prefix == b":":
+                    return int(line[1:-2])
+                elif prefix == b"$":
+                    length = int(line[1:-2])
+                    if length == -1:
+                        return None
+                    data = f.read(length)
+                    f.read(2)
+                    return data.decode("utf-8")
+                return None
+        except Exception:
+            return None
+
+    def get(self, key: str) -> str | None:
+        res = self.execute("GET", key)
+        return str(res) if res is not None else None
+
+    def set(self, key: str, val: str, ex: int | None = None) -> bool:
+        if ex:
+            return self.execute("SET", key, val, "EX", ex) is not None
+        return self.execute("SET", key, val) is not None
+
+    def decr(self, key: str) -> int | None:
+        res = self.execute("DECR", key)
+        return int(res) if isinstance(res, int) else None
+
+    def rpush(self, key: str, val: str) -> bool:
+        return self.execute("RPUSH", key, val) is not None
+
+    def hset(self, key: str, mapping: dict) -> bool:
+        args = ["HSET", key]
+        for k, v in mapping.items():
+            args.extend([k, str(v)])
+        return self.execute(*args) is not None
+
+
+redis_client = RedisClient(REDIS_HOST, REDIS_PORT)
 
 
 def load_policy() -> dict:
@@ -47,8 +112,13 @@ def load_policy() -> dict:
             "max_inflight": 100,
             "cancel_children_on_timeout": False,
         },
-        "queue": {
-            "visibility_timeout_ms": 2000,
+        "tool": {
+            "timeout_ms": 1000,
+            "max_attempts": 2,
+        },
+        "transport": {
+            "timeout_ms": 600,
+            "max_attempts": 2,
         },
         "retry_budget": {
             "enabled": False,
@@ -66,10 +136,7 @@ class OrchestratorState:
         self.workflow_generations = 0
         self.active_workflows = 0
         self.total_duration_seconds = 0.0
-        self.redis_backlog_count = 0
-        self.queue_redeliveries = 0
         self.orphaned_operations = 0
-        self.in_memory_queue = []
 
     def inc_active(self):
         with self.lock:
@@ -110,25 +177,37 @@ def execute_workflow(req_id: str, wf_id: str) -> dict:
     cancel_children = wf_cfg.get("cancel_children_on_timeout", False)
     max_inflight = wf_cfg.get("max_inflight", 100)
 
-    queue_cfg = policy.get("queue", {})
-    visibility_timeout = queue_cfg.get("visibility_timeout_ms", 2000) / 1000.0
-
     budget_cfg = policy.get("retry_budget", {})
+    budget_enabled = budget_cfg.get("enabled", False)
     initial_budget = budget_cfg.get("max_physical_attempts_per_workflow", 4)
 
-    # Admission control check
     with state.lock:
         if state.active_workflows >= max_inflight:
-            logger.warning(f"Admission control rejecting workflow {wf_id}: inflight={state.active_workflows}")
-            return {"status": "error", "error": "Admission control: system saturated", "code": 503}
+            return {
+                "status": "rejected",
+                "code": 503,
+                "error": "Max active workflows exceeded (admission control)",
+            }
         state.logical_requests += 1
 
     state.inc_active()
     start_time = time.time()
-    last_error = None
-    remaining_budget = initial_budget
+
+    # Durable Redis state tracking
+    redis_client.hset(
+        f"workflow:{wf_id}",
+        {
+            "logical_request_id": req_id,
+            "status": "active",
+            "created_at": time.time(),
+        },
+    )
+    redis_client.rpush("queue:pending", wf_id)
+    if budget_enabled:
+        redis_client.set(f"workflow:{wf_id}:retry_budget", str(initial_budget), ex=300)
 
     active_ops: list[str] = []
+    last_error = None
 
     for gen in range(max_generations):
         with state.lock:
@@ -136,68 +215,79 @@ def execute_workflow(req_id: str, wf_id: str) -> dict:
 
         op_id = f"{wf_id}-op-gen{gen}"
         active_ops.append(op_id)
+        redis_client.hset(f"workflow:{wf_id}", {"generation": gen, "active_op": op_id})
 
-        payload = json.dumps({
-            "logical_request_id": req_id,
-            "workflow_id": wf_id,
-            "operation_id": op_id,
-            "generation": gen,
-            "retry_budget": remaining_budget,
-        }).encode("utf-8")
+        result_holder: dict = {}
+        done_event = threading.Event()
 
-        req = urllib.request.Request(TOOL_GATEWAY_URL, data=payload, method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("X-Logical-Request-ID", req_id)
-        req.add_header("X-Workflow-ID", wf_id)
-        req.add_header("X-Operation-ID", op_id)
-        req.add_header("X-Generation", str(gen))
-        req.add_header("X-Retry-Budget", str(remaining_budget))
+        def _call_gateway(target_op: str, current_gen: int):
+            payload = json.dumps({
+                "logical_request_id": req_id,
+                "workflow_id": wf_id,
+                "operation_id": target_op,
+                "generation": current_gen,
+                "retry_budget": initial_budget,
+            }).encode("utf-8")
+            req = urllib.request.Request(TOOL_GATEWAY_URL, data=payload, method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("X-Logical-Request-ID", req_id)
+            req.add_header("X-Workflow-ID", wf_id)
+            req.add_header("X-Operation-ID", target_op)
+            req.add_header("X-Generation", str(current_gen))
+            req.add_header("X-Retry-Budget", str(initial_budget))
 
-        gen_start = time.time()
-        try:
-            with urllib.request.urlopen(req, timeout=planner_timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                duration = time.time() - start_time
-                state.dec_active(success=True, duration=duration)
-                logger.info(f"Workflow {wf_id} succeeded at generation {gen} in {duration:.3f}s")
-                return {
-                    "status": "success",
-                    "logical_request_id": req_id,
-                    "workflow_id": wf_id,
-                    "completed_generation": gen,
-                    "duration_seconds": duration,
-                    "result": data,
-                }
-        except Exception as e:
-            gen_elapsed = time.time() - gen_start
-            last_error = str(e)
-            is_timeout = "timed out" in str(e).lower()
+            try:
+                with urllib.request.urlopen(req, timeout=10.0) as resp:
+                    result_holder["response"] = json.loads(resp.read().decode("utf-8"))
+                    result_holder["status"] = "ok"
+            except Exception as e:
+                result_holder["status"] = "error"
+                result_holder["error"] = str(e)
+            finally:
+                done_event.set()
 
+        t = threading.Thread(target=_call_gateway, args=(op_id, gen), daemon=True)
+        t.start()
+
+        completed_in_time = done_event.wait(timeout=planner_timeout)
+
+        if completed_in_time and result_holder.get("status") == "ok":
+            duration = time.time() - start_time
+            state.dec_active(success=True, duration=duration)
+            redis_client.hset(f"workflow:{wf_id}", {"status": "succeeded", "duration": duration})
+
+            # Clean up earlier generations if cancellation enabled
+            if cancel_children:
+                for past_op in active_ops:
+                    if past_op != op_id:
+                        dispatch_tool_cancellation(past_op)
+
+            return {
+                "status": "success",
+                "logical_request_id": req_id,
+                "workflow_id": wf_id,
+                "generations_attempted": gen + 1,
+                "duration_seconds": duration,
+                "result": result_holder["response"],
+            }
+
+        # Planner deadline expired
+        if cancel_children:
+            logger.info(f"Planner timeout expired for gen={gen}; cancelling op_id={op_id}")
+            dispatch_tool_cancellation(op_id)
+        else:
+            with state.lock:
+                state.orphaned_operations += 1
             logger.warning(
-                f"Generation {gen} (op={op_id}) failed for wf={wf_id} after {gen_elapsed:.3f}s: {last_error}"
+                f"Planner timeout expired for gen={gen} ({planner_timeout}s); "
+                f"speculatively launching gen={gen+1} without cancelling orphaned op_id={op_id}"
             )
 
-            # Check queue lease expiration
-            if gen_elapsed > visibility_timeout:
-                with state.lock:
-                    state.queue_redeliveries += 1
-                logger.info(f"Queue lease expired for wf={wf_id} ({gen_elapsed:.3f}s > {visibility_timeout}s)")
-
-            # Speculative replanning: launch next generation
-            # If cancellation is enabled, cancel the timed-out operation
-            if cancel_children:
-                logger.info(f"Cancellation enabled: killing orphaned operation op={op_id}")
-                threading.Thread(target=dispatch_tool_cancellation, args=(op_id,), daemon=True).start()
-            else:
-                # Decoupled lifetime: operation op_id is left running in the backend as ORPHANED WORK
-                with state.lock:
-                    state.orphaned_operations += 1
-                logger.warning(f"Uncancelled operation op={op_id} continues running in background (ORPHANED WORK)")
-
-            remaining_budget = max(0, remaining_budget - 2)
+        last_error = result_holder.get("error", "Planner deadline timeout")
 
     duration = time.time() - start_time
     state.dec_active(success=False, duration=duration)
+    redis_client.hset(f"workflow:{wf_id}", {"status": "failed", "error": str(last_error)})
     return {
         "status": "error",
         "logical_request_id": req_id,
@@ -243,9 +333,6 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                     f"# HELP workflow_generation_total Total speculative replanning branches created\n"
                     f"# TYPE workflow_generation_total counter\n"
                     f"workflow_generation_total {state.workflow_generations}\n"
-                    f"# HELP queue_redeliveries_total Tasks redelivered due to lease expiration\n"
-                    f"# TYPE queue_redeliveries_total counter\n"
-                    f"queue_redeliveries_total {state.queue_redeliveries}\n"
                     f"# HELP orphaned_operations_created Operations left running after planner timeout\n"
                     f"# TYPE orphaned_operations_created counter\n"
                     f"orphaned_operations_created {state.orphaned_operations}\n"
@@ -292,7 +379,7 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
 def run_server():
     server_address = ("0.0.0.0", PORT)
     httpd = ThreadingHTTPServer(server_address, OrchestratorHandler)
-    logger.info(f"Starting Agent Orchestrator on 0.0.0.0:{PORT} (tools={TOOL_GATEWAY_URL})")
+    logger.info(f"Starting Agent Orchestrator on 0.0.0.0:{PORT} (tools={TOOL_GATEWAY_URL}, redis={REDIS_HOST}:{REDIS_PORT})")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

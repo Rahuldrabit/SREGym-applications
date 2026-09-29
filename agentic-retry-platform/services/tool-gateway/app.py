@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Tool Gateway Service for Agentic Retry Platform.
 
-Executes autonomous agent tool calls by delegating to Data API.
-Enforces timeout hierarchy, tool-level retries, HTTP transport retries,
-cancellation propagation (POST /tools/cancel), and end-to-end retry budget tracking.
+Executes tool operations against Data API. Implements:
+1. Two-layer nested retries (tool retry and HTTP transport retry) with proper max_attempts semantics.
+2. Atomic global retry budget enforcement via Redis (DECR workflow:{wf_id}:retry_budget).
+3. Propagation of detailed execution context (req_id, wf_id, op_id, gen, physical_attempt_id).
+4. Cancellation forwarding to Data API to terminate backend executions.
+5. Prometheus metrics exporter.
 """
 
 from __future__ import annotations
@@ -11,12 +14,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import sys
 import threading
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,7 +32,32 @@ logger = logging.getLogger("tool-gateway")
 PORT = int(os.environ.get("PORT", "8001"))
 DATA_API_URL = os.environ.get("DATA_API_URL", "http://data-api:8002/data/query")
 DATA_API_CANCEL_URL = os.environ.get("DATA_API_CANCEL_URL", "http://data-api:8002/data/cancel")
+REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 POLICY_PATH = os.environ.get("POLICY_PATH", "/etc/agent-policy/policy.json")
+
+
+class RedisClient:
+    def __init__(self, host: str, port: int, timeout: float = 1.0):
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+
+    def decr(self, key: str) -> int | None:
+        try:
+            with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
+                req = f"*2\r\n$4\r\nDECR\r\n${len(key.encode('utf-8'))}\r\n{key}\r\n"
+                sock.sendall(req.encode("utf-8"))
+                f = sock.makefile("rb")
+                line = f.readline()
+                if line and line[:1] == b":":
+                    return int(line[1:-2])
+        except Exception:
+            pass
+        return None
+
+
+redis_client = RedisClient(REDIS_HOST, REDIS_PORT)
 
 
 def load_policy() -> dict:
@@ -38,55 +68,72 @@ def load_policy() -> dict:
         except Exception as e:
             logger.warning(f"Failed to read policy from {POLICY_PATH}: {e}")
     return {
-        "tool": {"timeout_ms": 1400, "max_attempts": 2},
-        "transport": {"timeout_ms": 1200, "max_attempts": 2},
-        "retry_budget": {"enabled": False, "max_physical_attempts_per_workflow": 4},
+        "tool": {
+            "timeout_ms": 1000,
+            "max_attempts": 2,
+        },
+        "transport": {
+            "timeout_ms": 600,
+            "max_attempts": 2,
+        },
+        "retry_budget": {
+            "enabled": False,
+            "max_physical_attempts_per_workflow": 4,
+        },
     }
 
 
-class ToolGatewayMetrics:
+class GatewayMetrics:
     def __init__(self):
         self.lock = threading.Lock()
         self.operations_started = 0
         self.operations_completed = 0
-        self.unique_operations: set[str] = set()
         self.tool_retries = 0
         self.http_attempts = 0
         self.http_timeouts = 0
         self.cancellations_forwarded = 0
         self.budget_exhausted_total = 0
+        self.unique_operations = set()
 
 
-metrics = ToolGatewayMetrics()
+metrics = GatewayMetrics()
 
 
-def forward_cancellation(op_id: str):
-    """Sends cancellation request downstream to Data API."""
+def forward_cancellation(op_id: str, physical_attempt_id: str = ""):
+    """Dispatches cancellation signal to Data API."""
     try:
-        payload = json.dumps({"operation_id": op_id}).encode("utf-8")
+        payload = json.dumps({"operation_id": op_id, "physical_attempt_id": physical_attempt_id}).encode("utf-8")
         req = urllib.request.Request(DATA_API_CANCEL_URL, data=payload, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("X-Operation-ID", op_id)
-        with urllib.request.urlopen(req, timeout=2.0) as resp:
-            logger.info(f"Forwarded cancellation for op_id={op_id}: {resp.status}")
-        with metrics.lock:
-            metrics.cancellations_forwarded += 1
+        if physical_attempt_id:
+            req.add_header("X-Physical-Attempt-ID", physical_attempt_id)
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            with metrics.lock:
+                metrics.cancellations_forwarded += 1
+            logger.info(f"Forwarded cancellation for op_id={op_id} (att={physical_attempt_id})")
     except Exception as e:
-        logger.warning(f"Failed to forward cancellation for {op_id}: {e}")
+        logger.warning(f"Failed forwarding cancellation for op_id={op_id}: {e}")
 
 
-def execute_http_call(req_id: str, wf_id: str, op_id: str, gen: int, attempt: int, layer: str, budget: int) -> dict:
+def execute_http_call(
+    req_id: str,
+    wf_id: str,
+    op_id: str,
+    gen: int,
+    physical_attempt_id: str,
+    layer: str,
+) -> dict:
     policy = load_policy()
-    transport_timeout = policy.get("transport", {}).get("timeout_ms", 1200) / 1000.0
+    transport_timeout = policy.get("transport", {}).get("timeout_ms", 600) / 1000.0
 
     payload = json.dumps({
         "logical_request_id": req_id,
         "workflow_id": wf_id,
         "operation_id": op_id,
         "generation": gen,
-        "attempt": attempt,
-        "retry_layer": layer,
-        "retry_budget": budget,
+        "physical_attempt_id": physical_attempt_id,
+        "layer": layer,
     }).encode("utf-8")
 
     req = urllib.request.Request(DATA_API_URL, data=payload, method="POST")
@@ -95,9 +142,8 @@ def execute_http_call(req_id: str, wf_id: str, op_id: str, gen: int, attempt: in
     req.add_header("X-Workflow-ID", wf_id)
     req.add_header("X-Operation-ID", op_id)
     req.add_header("X-Generation", str(gen))
-    req.add_header("X-Attempt", str(attempt))
+    req.add_header("X-Physical-Attempt-ID", physical_attempt_id)
     req.add_header("X-Retry-Layer", layer)
-    req.add_header("X-Retry-Budget", str(budget))
 
     start = time.time()
     with metrics.lock:
@@ -117,40 +163,41 @@ def execute_http_call(req_id: str, wf_id: str, op_id: str, gen: int, attempt: in
         return {"status": "error", "error": str(e), "is_timeout": is_to, "latency": time.time() - start}
 
 
-def execute_tool_operation(req_id: str, wf_id: str, op_id: str, gen: int, budget: int) -> dict:
+def execute_tool_operation(req_id: str, wf_id: str, op_id: str, gen: int) -> dict:
     policy = load_policy()
-    tool_retries = policy.get("tool", {}).get("max_attempts", 2)
-    http_retries = policy.get("transport", {}).get("max_attempts", 2)
+    tool_attempts = policy.get("tool", {}).get("max_attempts", 2)
+    http_attempts = policy.get("transport", {}).get("max_attempts", 2)
     budget_enabled = policy.get("retry_budget", {}).get("enabled", False)
 
     with metrics.lock:
         metrics.operations_started += 1
         metrics.unique_operations.add(op_id)
 
-    curr_budget = budget
     last_error = None
 
-    for tool_try in range(tool_retries + 1):
+    for tool_try in range(tool_attempts):
         if tool_try > 0:
             with metrics.lock:
                 metrics.tool_retries += 1
 
         layer = "tool" if tool_try > 0 else "initial"
 
-        for http_try in range(http_retries + 1):
-            if budget_enabled and curr_budget <= 0:
-                with metrics.lock:
-                    metrics.budget_exhausted_total += 1
-                logger.warning(f"Retry budget exhausted ({budget}) for wf={wf_id} op={op_id}")
-                return {
-                    "status": "error",
-                    "error": "Global retry budget exhausted",
-                    "budget_exhausted": True,
-                }
+        for http_try in range(http_attempts):
+            if budget_enabled:
+                rem = redis_client.decr(f"workflow:{wf_id}:retry_budget")
+                if rem is not None and rem < 0:
+                    with metrics.lock:
+                        metrics.budget_exhausted_total += 1
+                    logger.warning(f"Global retry budget exhausted for wf={wf_id} op={op_id}")
+                    return {
+                        "status": "error",
+                        "error": "Global retry budget exhausted",
+                        "budget_exhausted": True,
+                    }
 
-            curr_budget -= 1
             http_layer = "transport" if http_try > 0 else layer
-            res = execute_http_call(req_id, wf_id, op_id, gen, tool_try * 3 + http_try + 1, http_layer, curr_budget)
+            physical_attempt_id = f"{op_id}-t{tool_try}-h{http_try}"
+            res = execute_http_call(req_id, wf_id, op_id, gen, physical_attempt_id, http_layer)
 
             if res["status"] == "ok":
                 with metrics.lock:
@@ -158,20 +205,18 @@ def execute_tool_operation(req_id: str, wf_id: str, op_id: str, gen: int, budget
                 return {
                     "status": "success",
                     "operation_id": op_id,
-                    "generation": gen,
-                    "tool_retries": tool_try,
-                    "http_retries": http_try,
-                    "remaining_budget": curr_budget,
-                    "result": res["data"],
+                    "physical_attempt_id": physical_attempt_id,
+                    "tool_attempt": tool_try + 1,
+                    "http_attempt": http_try + 1,
+                    "data": res["data"],
                 }
-            last_error = res.get("error", "timeout")
+
+            last_error = res["error"]
 
     return {
         "status": "error",
         "operation_id": op_id,
-        "generation": gen,
-        "error": f"Tool execution failed: {last_error}",
-        "remaining_budget": curr_budget,
+        "error": f"Tool operations exhausted: {last_error}",
     }
 
 
@@ -242,8 +287,9 @@ class ToolGatewayHandler(BaseHTTPRequestHandler):
 
         if self.path in ("/tools/cancel", "/cancel"):
             op_id = self.headers.get("X-Operation-ID", body.get("operation_id", ""))
-            threading.Thread(target=forward_cancellation, args=(op_id,), daemon=True).start()
-            self._send_json(200, {"status": "cancellation_dispatched", "operation_id": op_id})
+            att_id = self.headers.get("X-Physical-Attempt-ID", body.get("physical_attempt_id", ""))
+            threading.Thread(target=forward_cancellation, args=(op_id, att_id), daemon=True).start()
+            self._send_json(200, {"status": "cancellation_dispatched", "operation_id": op_id, "physical_attempt_id": att_id})
             return
 
         if self.path in ("/tools/execute", "/execute"):
@@ -251,9 +297,8 @@ class ToolGatewayHandler(BaseHTTPRequestHandler):
             wf_id = self.headers.get("X-Workflow-ID", body.get("workflow_id", "wf-unknown"))
             op_id = self.headers.get("X-Operation-ID", body.get("operation_id", f"{wf_id}-op"))
             gen = int(self.headers.get("X-Generation", body.get("generation", 0)))
-            budget = int(self.headers.get("X-Retry-Budget", body.get("retry_budget", 4)))
 
-            result = execute_tool_operation(req_id, wf_id, op_id, gen, budget)
+            result = execute_tool_operation(req_id, wf_id, op_id, gen)
             if result["status"] == "success":
                 self._send_json(200, result)
             else:
@@ -269,7 +314,7 @@ class ToolGatewayHandler(BaseHTTPRequestHandler):
 def run_server():
     server_address = ("0.0.0.0", PORT)
     httpd = ThreadingHTTPServer(server_address, ToolGatewayHandler)
-    logger.info(f"Starting Tool Gateway on 0.0.0.0:{PORT} (data_api={DATA_API_URL})")
+    logger.info(f"Starting Tool Gateway on 0.0.0.0:{PORT} (data_api={DATA_API_URL}, redis={REDIS_HOST}:{REDIS_PORT})")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

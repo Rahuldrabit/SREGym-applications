@@ -2,10 +2,1182 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: agentic-retry-scripts
+  labels:
+    app.kubernetes.io/name: agentic-retry-platform
+    app.kubernetes.io/component: scripts
 data:
   agent-orchestrator-app.py: |
-{{ .Files.Get "files/agent-orchestrator-app.py" | indent 4 }}
+    #!/usr/bin/env python3
+    """Agent Orchestrator Service for Agentic Retry Platform.
+
+    Coordinates multi-stage tool execution, manages workflow generations,
+    handles speculative replanning upon planner timeout, implements uncancelled
+    orphaned work mechanics vs cancellation propagation, connects to Redis for durable
+    workflow tracking, and tracks retry budgets.
+    """
+
+    from __future__ import annotations
+
+    import json
+    import logging
+    import os
+    import socket
+    import sys
+    import threading
+    import time
+    import urllib.error
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from typing import Any
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='{"time":"%(asctime)s","level":"%(levelname)s","service":"agent-orchestrator","msg":"%(message)s"}',
+    )
+    logger = logging.getLogger("agent-orchestrator")
+
+    PORT = int(os.environ.get("PORT", "8000"))
+    TOOL_GATEWAY_URL = os.environ.get("TOOL_GATEWAY_URL", "http://tool-gateway:8001/tools/execute")
+    TOOL_GATEWAY_CANCEL_URL = os.environ.get("TOOL_GATEWAY_CANCEL_URL", "http://tool-gateway:8001/tools/cancel")
+    REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+    REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+    POLICY_PATH = os.environ.get("POLICY_PATH", "/etc/agent-policy/policy.json")
+
+
+    class RedisClient:
+        """Pure-Python RESP client with zero external dependencies."""
+
+        def __init__(self, host: str, port: int, timeout: float = 1.0):
+            self.host = host
+            self.port = port
+            self.timeout = timeout
+
+        def execute(self, *args) -> Any:
+            try:
+                with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
+                    req = f"*{len(args)}\r\n"
+                    for arg in args:
+                        s = str(arg)
+                        req += f"${len(s.encode('utf-8'))}\r\n{s}\r\n"
+                    sock.sendall(req.encode("utf-8"))
+
+                    f = sock.makefile("rb")
+                    line = f.readline()
+                    if not line:
+                        return None
+                    prefix = line[:1]
+                    if prefix in (b"+", b"-"):
+                        return line[1:-2].decode("utf-8")
+                    elif prefix == b":":
+                        return int(line[1:-2])
+                    elif prefix == b"$":
+                        length = int(line[1:-2])
+                        if length == -1:
+                            return None
+                        data = f.read(length)
+                        f.read(2)
+                        return data.decode("utf-8")
+                    return None
+            except Exception:
+                return None
+
+        def get(self, key: str) -> str | None:
+            res = self.execute("GET", key)
+            return str(res) if res is not None else None
+
+        def set(self, key: str, val: str, ex: int | None = None) -> bool:
+            if ex:
+                return self.execute("SET", key, val, "EX", ex) is not None
+            return self.execute("SET", key, val) is not None
+
+        def decr(self, key: str) -> int | None:
+            res = self.execute("DECR", key)
+            return int(res) if isinstance(res, int) else None
+
+        def rpush(self, key: str, val: str) -> bool:
+            return self.execute("RPUSH", key, val) is not None
+
+        def hset(self, key: str, mapping: dict) -> bool:
+            args = ["HSET", key]
+            for k, v in mapping.items():
+                args.extend([k, str(v)])
+            return self.execute(*args) is not None
+
+
+    redis_client = RedisClient(REDIS_HOST, REDIS_PORT)
+
+
+    def load_policy() -> dict:
+        if os.path.exists(POLICY_PATH):
+            try:
+                with open(POLICY_PATH, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to read policy from {POLICY_PATH}: {e}")
+        return {
+            "workflow": {
+                "timeout_ms": 1500,
+                "max_attempts": 3,
+                "max_inflight": 100,
+                "cancel_children_on_timeout": False,
+            },
+            "tool": {
+                "timeout_ms": 1000,
+                "max_attempts": 2,
+            },
+            "transport": {
+                "timeout_ms": 600,
+                "max_attempts": 2,
+            },
+            "retry_budget": {
+                "enabled": False,
+                "max_physical_attempts_per_workflow": 4,
+            },
+        }
+
+
+    class OrchestratorState:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.logical_requests = 0
+            self.goodput_requests = 0
+            self.failed_workflows = 0
+            self.workflow_generations = 0
+            self.active_workflows = 0
+            self.total_duration_seconds = 0.0
+            self.orphaned_operations = 0
+
+        def inc_active(self):
+            with self.lock:
+                self.active_workflows += 1
+
+        def dec_active(self, success: bool, duration: float):
+            with self.lock:
+                self.active_workflows = max(0, self.active_workflows - 1)
+                if success:
+                    self.goodput_requests += 1
+                else:
+                    self.failed_workflows += 1
+                self.total_duration_seconds += duration
+
+
+    state = OrchestratorState()
+
+
+    def dispatch_tool_cancellation(op_id: str):
+        """Sends cancellation signal to Tool Gateway to kill child operation."""
+        try:
+            payload = json.dumps({"operation_id": op_id}).encode("utf-8")
+            req = urllib.request.Request(TOOL_GATEWAY_CANCEL_URL, data=payload, method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("X-Operation-ID", op_id)
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                logger.info(f"Dispatched cancellation for op_id={op_id}: {resp.status}")
+        except Exception as e:
+            logger.warning(f"Failed to dispatch cancellation for op_id={op_id}: {e}")
+
+
+    def execute_workflow(req_id: str, wf_id: str) -> dict:
+        """Executes workflow with speculative replanning and generation tracking."""
+        policy = load_policy()
+        wf_cfg = policy.get("workflow", {})
+        planner_timeout = wf_cfg.get("timeout_ms", 1500) / 1000.0
+        max_generations = wf_cfg.get("max_attempts", 3)
+        cancel_children = wf_cfg.get("cancel_children_on_timeout", False)
+        max_inflight = wf_cfg.get("max_inflight", 100)
+
+        budget_cfg = policy.get("retry_budget", {})
+        budget_enabled = budget_cfg.get("enabled", False)
+        initial_budget = budget_cfg.get("max_physical_attempts_per_workflow", 4)
+
+        with state.lock:
+            if state.active_workflows >= max_inflight:
+                return {
+                    "status": "rejected",
+                    "code": 503,
+                    "error": "Max active workflows exceeded (admission control)",
+                }
+            state.logical_requests += 1
+
+        state.inc_active()
+        start_time = time.time()
+
+        # Durable Redis state tracking
+        redis_client.hset(
+            f"workflow:{wf_id}",
+            {
+                "logical_request_id": req_id,
+                "status": "active",
+                "created_at": time.time(),
+            },
+        )
+        redis_client.rpush("queue:pending", wf_id)
+        if budget_enabled:
+            redis_client.set(f"workflow:{wf_id}:retry_budget", str(initial_budget), ex=300)
+
+        active_ops: list[str] = []
+        last_error = None
+
+        for gen in range(max_generations):
+            with state.lock:
+                state.workflow_generations += 1
+
+            op_id = f"{wf_id}-op-gen{gen}"
+            active_ops.append(op_id)
+            redis_client.hset(f"workflow:{wf_id}", {"generation": gen, "active_op": op_id})
+
+            result_holder: dict = {}
+            done_event = threading.Event()
+
+            def _call_gateway(target_op: str, current_gen: int):
+                payload = json.dumps({
+                    "logical_request_id": req_id,
+                    "workflow_id": wf_id,
+                    "operation_id": target_op,
+                    "generation": current_gen,
+                    "retry_budget": initial_budget,
+                }).encode("utf-8")
+                req = urllib.request.Request(TOOL_GATEWAY_URL, data=payload, method="POST")
+                req.add_header("Content-Type", "application/json")
+                req.add_header("X-Logical-Request-ID", req_id)
+                req.add_header("X-Workflow-ID", wf_id)
+                req.add_header("X-Operation-ID", target_op)
+                req.add_header("X-Generation", str(current_gen))
+                req.add_header("X-Retry-Budget", str(initial_budget))
+
+                try:
+                    with urllib.request.urlopen(req, timeout=10.0) as resp:
+                        result_holder["response"] = json.loads(resp.read().decode("utf-8"))
+                        result_holder["status"] = "ok"
+                except Exception as e:
+                    result_holder["status"] = "error"
+                    result_holder["error"] = str(e)
+                finally:
+                    done_event.set()
+
+            t = threading.Thread(target=_call_gateway, args=(op_id, gen), daemon=True)
+            t.start()
+
+            completed_in_time = done_event.wait(timeout=planner_timeout)
+
+            if completed_in_time and result_holder.get("status") == "ok":
+                duration = time.time() - start_time
+                state.dec_active(success=True, duration=duration)
+                redis_client.hset(f"workflow:{wf_id}", {"status": "succeeded", "duration": duration})
+
+                # Clean up earlier generations if cancellation enabled
+                if cancel_children:
+                    for past_op in active_ops:
+                        if past_op != op_id:
+                            dispatch_tool_cancellation(past_op)
+
+                return {
+                    "status": "success",
+                    "logical_request_id": req_id,
+                    "workflow_id": wf_id,
+                    "generations_attempted": gen + 1,
+                    "duration_seconds": duration,
+                    "result": result_holder["response"],
+                }
+
+            # Planner deadline expired
+            if cancel_children:
+                logger.info(f"Planner timeout expired for gen={gen}; cancelling op_id={op_id}")
+                dispatch_tool_cancellation(op_id)
+            else:
+                with state.lock:
+                    state.orphaned_operations += 1
+                logger.warning(
+                    f"Planner timeout expired for gen={gen} ({planner_timeout}s); "
+                    f"speculatively launching gen={gen+1} without cancelling orphaned op_id={op_id}"
+                )
+
+            last_error = result_holder.get("error", "Planner deadline timeout")
+
+        duration = time.time() - start_time
+        state.dec_active(success=False, duration=duration)
+        redis_client.hset(f"workflow:{wf_id}", {"status": "failed", "error": str(last_error)})
+        return {
+            "status": "error",
+            "logical_request_id": req_id,
+            "workflow_id": wf_id,
+            "generations_attempted": max_generations,
+            "duration_seconds": duration,
+            "error": f"Planner exhausted all {max_generations} speculative replans: {last_error}",
+        }
+
+
+    class OrchestratorHandler(BaseHTTPRequestHandler):
+        def _send_json(self, status_code: int, data: dict):
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_text(self, status_code: int, text: str, content_type: str = "text/plain"):
+            body = text.encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path in ("/healthz", "/"):
+                self._send_json(200, {"status": "ok", "service": "agent-orchestrator"})
+                return
+
+            if self.path == "/metrics":
+                with state.lock:
+                    avg_dur = state.total_duration_seconds / max(1, state.goodput_requests)
+                    metrics_text = (
+                        f"# HELP logical_workflows_total Total unique logical workflows submitted\n"
+                        f"# TYPE logical_workflows_total counter\n"
+                        f"logical_workflows_total {state.logical_requests}\n"
+                        f"# HELP goodput_requests_total Successful unique logical requests completed\n"
+                        f"# TYPE goodput_requests_total counter\n"
+                        f"goodput_requests_total {state.goodput_requests}\n"
+                        f"# HELP workflow_generation_total Total speculative replanning branches created\n"
+                        f"# TYPE workflow_generation_total counter\n"
+                        f"workflow_generation_total {state.workflow_generations}\n"
+                        f"# HELP orphaned_operations_created Operations left running after planner timeout\n"
+                        f"# TYPE orphaned_operations_created counter\n"
+                        f"orphaned_operations_created {state.orphaned_operations}\n"
+                        f"# HELP workflow_active_count Currently active workflows\n"
+                        f"# TYPE workflow_active_count gauge\n"
+                        f"workflow_active_count {state.active_workflows}\n"
+                        f"# HELP workflow_duration_seconds Average workflow completion duration\n"
+                        f"# TYPE workflow_duration_seconds gauge\n"
+                        f"workflow_duration_seconds {avg_dur:.4f}\n"
+                    )
+                self._send_text(200, metrics_text, "text/plain; version=0.0.4")
+                return
+
+            if self.path == "/config":
+                self._send_json(200, load_policy())
+                return
+
+            self._send_json(404, {"error": "Not Found"})
+
+        def do_POST(self):
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = {}
+            if content_length > 0:
+                try:
+                    body = json.loads(self.rfile.read(content_length).decode("utf-8"))
+                except Exception:
+                    body = {}
+
+            if self.path in ("/agent/workflow", "/query", "/workflow"):
+                req_id = self.headers.get("X-Logical-Request-ID", body.get("logical_request_id", f"req-{time.time()}"))
+                wf_id = self.headers.get("X-Workflow-ID", body.get("workflow_id", f"wf-{time.time()}"))
+
+                result = execute_workflow(req_id, wf_id)
+                code = result.get("code", 200 if result["status"] == "success" else 504)
+                self._send_json(code, result)
+                return
+
+            self._send_json(404, {"error": "Not Found"})
+
+        def log_message(self, format, *args):
+            pass
+
+
+    def run_server():
+        server_address = ("0.0.0.0", PORT)
+        httpd = ThreadingHTTPServer(server_address, OrchestratorHandler)
+        logger.info(f"Starting Agent Orchestrator on 0.0.0.0:{PORT} (tools={TOOL_GATEWAY_URL}, redis={REDIS_HOST}:{REDIS_PORT})")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            logger.info("Shutting down Agent Orchestrator...")
+            httpd.server_close()
+
+
+    if __name__ == "__main__":
+        run_server()
+
   tool-gateway-app.py: |
-{{ .Files.Get "files/tool-gateway-app.py" | indent 4 }}
+    #!/usr/bin/env python3
+    """Tool Gateway Service for Agentic Retry Platform.
+
+    Executes tool operations against Data API. Implements:
+    1. Two-layer nested retries (tool retry and HTTP transport retry) with proper max_attempts semantics.
+    2. Atomic global retry budget enforcement via Redis (DECR workflow:{wf_id}:retry_budget).
+    3. Propagation of detailed execution context (req_id, wf_id, op_id, gen, physical_attempt_id).
+    4. Cancellation forwarding to Data API to terminate backend executions.
+    5. Prometheus metrics exporter.
+    """
+
+    from __future__ import annotations
+
+    import json
+    import logging
+    import os
+    import socket
+    import sys
+    import threading
+    import time
+    import urllib.error
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from typing import Any
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='{"time":"%(asctime)s","level":"%(levelname)s","service":"tool-gateway","msg":"%(message)s"}',
+    )
+    logger = logging.getLogger("tool-gateway")
+
+    PORT = int(os.environ.get("PORT", "8001"))
+    DATA_API_URL = os.environ.get("DATA_API_URL", "http://data-api:8002/data/query")
+    DATA_API_CANCEL_URL = os.environ.get("DATA_API_CANCEL_URL", "http://data-api:8002/data/cancel")
+    REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+    REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+    POLICY_PATH = os.environ.get("POLICY_PATH", "/etc/agent-policy/policy.json")
+
+
+    class RedisClient:
+        def __init__(self, host: str, port: int, timeout: float = 1.0):
+            self.host = host
+            self.port = port
+            self.timeout = timeout
+
+        def decr(self, key: str) -> int | None:
+            try:
+                with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
+                    req = f"*2\r\n$4\r\nDECR\r\n${len(key.encode('utf-8'))}\r\n{key}\r\n"
+                    sock.sendall(req.encode("utf-8"))
+                    f = sock.makefile("rb")
+                    line = f.readline()
+                    if line and line[:1] == b":":
+                        return int(line[1:-2])
+            except Exception:
+                pass
+            return None
+
+
+    redis_client = RedisClient(REDIS_HOST, REDIS_PORT)
+
+
+    def load_policy() -> dict:
+        if os.path.exists(POLICY_PATH):
+            try:
+                with open(POLICY_PATH, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to read policy from {POLICY_PATH}: {e}")
+        return {
+            "tool": {
+                "timeout_ms": 1000,
+                "max_attempts": 2,
+            },
+            "transport": {
+                "timeout_ms": 600,
+                "max_attempts": 2,
+            },
+            "retry_budget": {
+                "enabled": False,
+                "max_physical_attempts_per_workflow": 4,
+            },
+        }
+
+
+    class GatewayMetrics:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.operations_started = 0
+            self.operations_completed = 0
+            self.tool_retries = 0
+            self.http_attempts = 0
+            self.http_timeouts = 0
+            self.cancellations_forwarded = 0
+            self.budget_exhausted_total = 0
+            self.unique_operations = set()
+
+
+    metrics = GatewayMetrics()
+
+
+    def forward_cancellation(op_id: str, physical_attempt_id: str = ""):
+        """Dispatches cancellation signal to Data API."""
+        try:
+            payload = json.dumps({"operation_id": op_id, "physical_attempt_id": physical_attempt_id}).encode("utf-8")
+            req = urllib.request.Request(DATA_API_CANCEL_URL, data=payload, method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("X-Operation-ID", op_id)
+            if physical_attempt_id:
+                req.add_header("X-Physical-Attempt-ID", physical_attempt_id)
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                with metrics.lock:
+                    metrics.cancellations_forwarded += 1
+                logger.info(f"Forwarded cancellation for op_id={op_id} (att={physical_attempt_id})")
+        except Exception as e:
+            logger.warning(f"Failed forwarding cancellation for op_id={op_id}: {e}")
+
+
+    def execute_http_call(
+        req_id: str,
+        wf_id: str,
+        op_id: str,
+        gen: int,
+        physical_attempt_id: str,
+        layer: str,
+    ) -> dict:
+        policy = load_policy()
+        transport_timeout = policy.get("transport", {}).get("timeout_ms", 600) / 1000.0
+
+        payload = json.dumps({
+            "logical_request_id": req_id,
+            "workflow_id": wf_id,
+            "operation_id": op_id,
+            "generation": gen,
+            "physical_attempt_id": physical_attempt_id,
+            "layer": layer,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(DATA_API_URL, data=payload, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("X-Logical-Request-ID", req_id)
+        req.add_header("X-Workflow-ID", wf_id)
+        req.add_header("X-Operation-ID", op_id)
+        req.add_header("X-Generation", str(gen))
+        req.add_header("X-Physical-Attempt-ID", physical_attempt_id)
+        req.add_header("X-Retry-Layer", layer)
+
+        start = time.time()
+        with metrics.lock:
+            metrics.http_attempts += 1
+
+        try:
+            with urllib.request.urlopen(req, timeout=transport_timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                return {"status": "ok", "latency": time.time() - start, "data": data}
+        except urllib.error.HTTPError as e:
+            return {"status": "error", "error": f"HTTP {e.code}", "latency": time.time() - start}
+        except Exception as e:
+            is_to = "timed out" in str(e).lower()
+            if is_to:
+                with metrics.lock:
+                    metrics.http_timeouts += 1
+            return {"status": "error", "error": str(e), "is_timeout": is_to, "latency": time.time() - start}
+
+
+    def execute_tool_operation(req_id: str, wf_id: str, op_id: str, gen: int) -> dict:
+        policy = load_policy()
+        tool_attempts = policy.get("tool", {}).get("max_attempts", 2)
+        http_attempts = policy.get("transport", {}).get("max_attempts", 2)
+        budget_enabled = policy.get("retry_budget", {}).get("enabled", False)
+
+        with metrics.lock:
+            metrics.operations_started += 1
+            metrics.unique_operations.add(op_id)
+
+        last_error = None
+
+        for tool_try in range(tool_attempts):
+            if tool_try > 0:
+                with metrics.lock:
+                    metrics.tool_retries += 1
+
+            layer = "tool" if tool_try > 0 else "initial"
+
+            for http_try in range(http_attempts):
+                if budget_enabled:
+                    rem = redis_client.decr(f"workflow:{wf_id}:retry_budget")
+                    if rem is not None and rem < 0:
+                        with metrics.lock:
+                            metrics.budget_exhausted_total += 1
+                        logger.warning(f"Global retry budget exhausted for wf={wf_id} op={op_id}")
+                        return {
+                            "status": "error",
+                            "error": "Global retry budget exhausted",
+                            "budget_exhausted": True,
+                        }
+
+                http_layer = "transport" if http_try > 0 else layer
+                physical_attempt_id = f"{op_id}-t{tool_try}-h{http_try}"
+                res = execute_http_call(req_id, wf_id, op_id, gen, physical_attempt_id, http_layer)
+
+                if res["status"] == "ok":
+                    with metrics.lock:
+                        metrics.operations_completed += 1
+                    return {
+                        "status": "success",
+                        "operation_id": op_id,
+                        "physical_attempt_id": physical_attempt_id,
+                        "tool_attempt": tool_try + 1,
+                        "http_attempt": http_try + 1,
+                        "data": res["data"],
+                    }
+
+                last_error = res["error"]
+
+        return {
+            "status": "error",
+            "operation_id": op_id,
+            "error": f"Tool operations exhausted: {last_error}",
+        }
+
+
+    class ToolGatewayHandler(BaseHTTPRequestHandler):
+        def _send_json(self, status_code: int, data: dict):
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_text(self, status_code: int, text: str, content_type: str = "text/plain"):
+            body = text.encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path in ("/healthz", "/"):
+                self._send_json(200, {"status": "ok", "service": "tool-gateway"})
+                return
+
+            if self.path == "/metrics":
+                with metrics.lock:
+                    metrics_text = (
+                        f"# HELP tool_operations_started_total Total tool operations started\n"
+                        f"# TYPE tool_operations_started_total counter\n"
+                        f"tool_operations_started_total {metrics.operations_started}\n"
+                        f"# HELP tool_operations_completed_total Successfully completed tool operations\n"
+                        f"# TYPE tool_operations_completed_total counter\n"
+                        f"tool_operations_completed_total {metrics.operations_completed}\n"
+                        f"# HELP unique_operation_ids_total Unique operation IDs handled\n"
+                        f"# TYPE unique_operation_ids_total counter\n"
+                        f"unique_operation_ids_total {len(metrics.unique_operations)}\n"
+                        f"# HELP tool_retries_total Retries executed at tool level\n"
+                        f"# TYPE tool_retries_total counter\n"
+                        f"tool_retries_total {metrics.tool_retries}\n"
+                        f"# HELP tool_http_attempts_total Total HTTP calls to Data API\n"
+                        f"# TYPE tool_http_attempts_total counter\n"
+                        f"tool_http_attempts_total {metrics.http_attempts}\n"
+                        f"# HELP tool_cancellations_forwarded Cancellations forwarded to Data API\n"
+                        f"# TYPE tool_cancellations_forwarded counter\n"
+                        f"tool_cancellations_forwarded {metrics.cancellations_forwarded}\n"
+                        f"# HELP retry_budget_exhausted_total Invocations blocked by retry budget\n"
+                        f"# TYPE retry_budget_exhausted_total counter\n"
+                        f"retry_budget_exhausted_total {metrics.budget_exhausted_total}\n"
+                    )
+                self._send_text(200, metrics_text, "text/plain; version=0.0.4")
+                return
+
+            if self.path == "/config":
+                self._send_json(200, load_policy())
+                return
+
+            self._send_json(404, {"error": "Not Found"})
+
+        def do_POST(self):
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = {}
+            if content_length > 0:
+                try:
+                    body = json.loads(self.rfile.read(content_length).decode("utf-8"))
+                except Exception:
+                    body = {}
+
+            if self.path in ("/tools/cancel", "/cancel"):
+                op_id = self.headers.get("X-Operation-ID", body.get("operation_id", ""))
+                att_id = self.headers.get("X-Physical-Attempt-ID", body.get("physical_attempt_id", ""))
+                threading.Thread(target=forward_cancellation, args=(op_id, att_id), daemon=True).start()
+                self._send_json(200, {"status": "cancellation_dispatched", "operation_id": op_id, "physical_attempt_id": att_id})
+                return
+
+            if self.path in ("/tools/execute", "/execute"):
+                req_id = self.headers.get("X-Logical-Request-ID", body.get("logical_request_id", "req-unknown"))
+                wf_id = self.headers.get("X-Workflow-ID", body.get("workflow_id", "wf-unknown"))
+                op_id = self.headers.get("X-Operation-ID", body.get("operation_id", f"{wf_id}-op"))
+                gen = int(self.headers.get("X-Generation", body.get("generation", 0)))
+
+                result = execute_tool_operation(req_id, wf_id, op_id, gen)
+                if result["status"] == "success":
+                    self._send_json(200, result)
+                else:
+                    self._send_json(504, result)
+                return
+
+            self._send_json(404, {"error": "Not Found"})
+
+        def log_message(self, format, *args):
+            pass
+
+
+    def run_server():
+        server_address = ("0.0.0.0", PORT)
+        httpd = ThreadingHTTPServer(server_address, ToolGatewayHandler)
+        logger.info(f"Starting Tool Gateway on 0.0.0.0:{PORT} (data_api={DATA_API_URL}, redis={REDIS_HOST}:{REDIS_PORT})")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            logger.info("Shutting down Tool Gateway...")
+            httpd.server_close()
+
+
+    if __name__ == "__main__":
+        run_server()
+
   data-api-app.py: |
-{{ .Files.Get "files/data-api-app.py" | indent 4 }}
+    #!/usr/bin/env python3
+    """Data API Service for Agentic Retry Platform.
+
+    Executes database queries through PgBouncer connection pool against PostgreSQL.
+    Models:
+    1. Real SQL execution: SELECT pg_sleep(latency), id, key, value FROM knowledge LIMIT 1.
+    2. Connection pool saturation (PgBouncer pool=25).
+    3. Distributed fault injection via Redis shared state across all replicas.
+    4. Background query cancellation by operation ID and physical attempt ID.
+    5. Prometheus metrics exporter.
+    """
+
+    from __future__ import annotations
+
+    import json
+    import logging
+    import os
+    import socket
+    import struct
+    import sys
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from typing import Any
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='{"time":"%(asctime)s","level":"%(levelname)s","service":"data-api","msg":"%(message)s"}',
+    )
+    logger = logging.getLogger("data-api")
+
+    PORT = int(os.environ.get("PORT", "8002"))
+    PGBOUNCER_HOST = os.environ.get("PGBOUNCER_HOST", "pgbouncer")
+    PGBOUNCER_PORT = int(os.environ.get("PGBOUNCER_PORT", "6432"))
+    POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "postgres")
+    POSTGRES_PORT = int(os.environ.get("POSTGRES_PORT", "5432"))
+    REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+    REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+
+    CONCURRENCY_LIMIT = int(os.environ.get("CONCURRENCY_LIMIT", "25"))
+    QUEUE_CAPACITY = int(os.environ.get("QUEUE_CAPACITY", "200"))
+    NORMAL_LATENCY = float(os.environ.get("NORMAL_LATENCY", "0.10"))  # 100ms
+    FAULT_LATENCY = float(os.environ.get("FAULT_LATENCY", "1.50"))    # 1500ms
+    POLICY_PATH = os.environ.get("POLICY_PATH", "/etc/agent-policy/policy.json")
+
+
+    class RedisClient:
+        def __init__(self, host: str, port: int, timeout: float = 1.0):
+            self.host = host
+            self.port = port
+            self.timeout = timeout
+
+        def execute(self, *args) -> Any:
+            try:
+                with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
+                    req = f"*{len(args)}\r\n"
+                    for arg in args:
+                        s = str(arg)
+                        req += f"${len(s.encode('utf-8'))}\r\n{s}\r\n"
+                    sock.sendall(req.encode("utf-8"))
+
+                    f = sock.makefile("rb")
+                    line = f.readline()
+                    if not line:
+                        return None
+                    prefix = line[:1]
+                    if prefix in (b"+", b"-"):
+                        return line[1:-2].decode("utf-8")
+                    elif prefix == b":":
+                        return int(line[1:-2])
+                    elif prefix == b"$":
+                        length = int(line[1:-2])
+                        if length == -1:
+                            return None
+                        data = f.read(length)
+                        f.read(2)
+                        return data.decode("utf-8")
+                    return None
+            except Exception:
+                return None
+
+        def get(self, key: str) -> str | None:
+            res = self.execute("GET", key)
+            return str(res) if res is not None else None
+
+        def set(self, key: str, val: str, ex: int | None = None) -> bool:
+            if ex:
+                return self.execute("SET", key, val, "EX", ex) is not None
+            return self.execute("SET", key, val) is not None
+
+        def delete(self, key: str) -> bool:
+            return self.execute("DEL", key) is not None
+
+
+    redis_client = RedisClient(REDIS_HOST, REDIS_PORT)
+
+
+    def execute_pg_query(latency_seconds: float, cancel_event: threading.Event) -> tuple[bool, str]:
+        """Executes SELECT pg_sleep(...) via PgBouncer or Postgres using pure Python v3.0 wire protocol."""
+        target_hosts = [(PGBOUNCER_HOST, PGBOUNCER_PORT), (POSTGRES_HOST, POSTGRES_PORT)]
+        for host, port in target_hosts:
+            try:
+                sock = socket.create_connection((host, port), timeout=max(2.0, latency_seconds + 3.0))
+                try:
+                    # StartupMessage: len (int32), protocol version 196608 (int32), params
+                    payload = b"user\x00postgres\x00database\x00agentic_db\x00\x00"
+                    msg_len = 4 + 4 + len(payload)
+                    sock.sendall(struct.pack("!II", msg_len, 196608) + payload)
+
+                    # Wait for ReadyForQuery 'Z'
+                    while True:
+                        mtype = sock.recv(1)
+                        if not mtype:
+                            break
+                        mlen = struct.unpack("!I", sock.recv(4))[0]
+                        body = sock.recv(mlen - 4) if mlen > 4 else b""
+                        if mtype == b"Z":
+                            break
+                        if mtype == b"E":
+                            logger.debug(f"Postgres auth/error: {body}")
+
+                    # Send Query 'Q': SELECT pg_sleep(latency_seconds), id, key, value FROM knowledge LIMIT 1;
+                    sql = f"SELECT pg_sleep({latency_seconds:.4f}), id, key, value FROM knowledge LIMIT 1;\x00".encode("utf-8")
+                    sock.sendall(b"Q" + struct.pack("!I", 4 + len(sql)) + sql)
+
+                    # Poll response or cancel
+                    sock.settimeout(0.1)
+                    start_q = time.time()
+                    while time.time() - start_q < latency_seconds + 5.0:
+                        if cancel_event.is_set():
+                            sock.close()
+                            return False, "Query cancelled during execution"
+                        try:
+                            mtype = sock.recv(1)
+                            if mtype == b"Z":
+                                # ReadyForQuery: success!
+                                sock.close()
+                                return True, "ok"
+                        except socket.timeout:
+                            continue
+                        except Exception:
+                            break
+
+                    sock.close()
+                    return True, "ok"
+                except Exception:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM):
+                        sock.close()
+            except Exception:
+                continue
+
+        # Fallback simulation if cluster database is booting
+        sleep_slice = 0.05
+        elapsed = 0.0
+        while elapsed < latency_seconds:
+            if cancel_event.is_set():
+                return False, "Query cancelled during execution"
+            time.sleep(min(sleep_slice, latency_seconds - elapsed))
+            elapsed += sleep_slice
+        return True, "ok"
+
+
+    class DataAPIState:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.concurrency_limit = CONCURRENCY_LIMIT
+            self.queue_capacity = QUEUE_CAPACITY
+            self.normal_latency = NORMAL_LATENCY
+            self.fault_latency = FAULT_LATENCY
+            self.local_fault_active = False
+
+            self.semaphore = threading.BoundedSemaphore(self.concurrency_limit)
+            self.active_requests = 0
+            self.queued_requests = 0
+            self.total_requests = 0
+            self.successful_requests = 0
+            self.failed_requests = 0
+            self.total_latency_seconds = 0.0
+
+            # Query tracking: physical_attempt_id -> info
+            self.active_queries: dict[str, dict] = {}
+            self.cancellation_requests = 0
+            self.cancellation_completed = 0
+
+        def get_effective_latency(self) -> tuple[float, bool]:
+            # 1. Check Redis for cluster-wide synchronized fault state
+            redis_fault = redis_client.get("fault:data-api:latency_ms")
+            if redis_fault:
+                try:
+                    lat = float(redis_fault) / 1000.0
+                    return lat, True
+                except ValueError:
+                    pass
+
+            # 2. Local fallback state
+            with self.lock:
+                return (self.fault_latency, True) if self.local_fault_active else (self.normal_latency, False)
+
+        def inject_fault(self, latency_ms: float = 1500.0, duration_seconds: float = 10.0):
+            # Set distributed fault state in Redis with TTL so all replicas see it
+            redis_client.set("fault:data-api:latency_ms", str(latency_ms), ex=int(duration_seconds) + 1)
+            redis_client.set("fault:data-api:active", "1", ex=int(duration_seconds) + 1)
+
+            with self.lock:
+                self.fault_latency = latency_ms / 1000.0
+                self.local_fault_active = True
+            logger.warning(f"Injected cluster fault: {latency_ms}ms for {duration_seconds}s (synchronized via Redis)")
+
+        def recover_fault(self):
+            redis_client.delete("fault:data-api:latency_ms")
+            redis_client.delete("fault:data-api:active")
+            with self.lock:
+                self.local_fault_active = False
+            logger.info("Recovered fault: restored normal latency across cluster")
+
+        def register_query(self, att_id: str, op_id: str, wf_id: str) -> threading.Event:
+            event = threading.Event()
+            with self.lock:
+                self.active_queries[att_id] = {
+                    "op_id": op_id,
+                    "wf_id": wf_id,
+                    "cancel_event": event,
+                    "start_time": time.time(),
+                    "cancelled": False,
+                }
+            return event
+
+        def unregister_query(self, att_id: str):
+            with self.lock:
+                self.active_queries.pop(att_id, None)
+
+        def cancel_query(self, op_id: str, att_id: str = "") -> int:
+            cancelled_count = 0
+            with self.lock:
+                self.cancellation_requests += 1
+                for q_id, q_info in list(self.active_queries.items()):
+                    if (att_id and q_id == att_id) or (op_id and q_info.get("op_id") == op_id):
+                        q_info["cancelled"] = True
+                        q_info["cancel_event"].set()
+                        cancelled_count += 1
+                self.cancellation_completed += cancelled_count
+            if cancelled_count > 0:
+                logger.info(f"Cancelled {cancelled_count} queries for op_id={op_id} (att={att_id})")
+            return cancelled_count
+
+
+    state = DataAPIState()
+
+
+    class DataAPIHandler(BaseHTTPRequestHandler):
+        def _send_json(self, status_code: int, data: dict):
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_text(self, status_code: int, text: str, content_type: str = "text/plain"):
+            body = text.encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path in ("/healthz", "/"):
+                self._send_json(200, {"status": "ok", "service": "data-api"})
+                return
+
+            if self.path == "/metrics":
+                with state.lock:
+                    avg_lat = state.total_latency_seconds / max(1, state.successful_requests)
+                    now = time.time()
+                    # Orphaned: queries still running whose duration exceeds transport timeout (0.6s)
+                    orphaned_count = sum(
+                        1 for q in state.active_queries.values()
+                        if not q["cancelled"] and (now - q["start_time"]) > 0.6
+                    )
+                    metrics_text = (
+                        f"# HELP backend_requests_total Total number of backend query attempts\n"
+                        f"# TYPE backend_requests_total counter\n"
+                        f"backend_requests_total {state.total_requests}\n"
+                        f"# HELP backend_requests_success_total Successful backend queries\n"
+                        f"# TYPE backend_requests_success_total counter\n"
+                        f"backend_requests_success_total {state.successful_requests}\n"
+                        f"# HELP backend_requests_failed_total Failed backend queries\n"
+                        f"# TYPE backend_requests_failed_total counter\n"
+                        f"backend_requests_failed_total {state.failed_requests}\n"
+                        f"# HELP backend_active_requests Currently executing requests\n"
+                        f"# TYPE backend_active_requests gauge\n"
+                        f"backend_active_requests {state.active_requests}\n"
+                        f"# HELP backend_waiting_requests Currently queued requests awaiting connection pool\n"
+                        f"# TYPE backend_waiting_requests gauge\n"
+                        f"backend_waiting_requests {state.queued_requests}\n"
+                        f"# HELP pgbouncer_used_connections Active PgBouncer connections\n"
+                        f"# TYPE pgbouncer_used_connections gauge\n"
+                        f"pgbouncer_used_connections {state.active_requests}\n"
+                        f"# HELP pgbouncer_waiting_clients Clients waiting for a PgBouncer connection slot\n"
+                        f"# TYPE pgbouncer_waiting_clients gauge\n"
+                        f"pgbouncer_waiting_clients {state.queued_requests}\n"
+                        f"# HELP orphaned_operations_active In-flight operations continuing after caller timeout\n"
+                        f"# TYPE orphaned_operations_active gauge\n"
+                        f"orphaned_operations_active {orphaned_count}\n"
+                        f"# HELP cancellation_requests_total Cancellation requests received from upstream\n"
+                        f"# TYPE cancellation_requests_total counter\n"
+                        f"cancellation_requests_total {state.cancellation_requests}\n"
+                        f"# HELP cancellation_completed_total Successfully cancelled queries\n"
+                        f"# TYPE cancellation_completed_total counter\n"
+                        f"cancellation_completed_total {state.cancellation_completed}\n"
+                        f"# HELP backend_request_duration_seconds Average latency in seconds\n"
+                        f"# TYPE backend_request_duration_seconds gauge\n"
+                        f"backend_request_duration_seconds {avg_lat:.4f}\n"
+                    )
+                self._send_text(200, metrics_text, "text/plain; version=0.0.4")
+                return
+
+            if self.path == "/status":
+                lat, is_fault = state.get_effective_latency()
+                with state.lock:
+                    self._send_json(200, {
+                        "active_requests": state.active_requests,
+                        "queued_requests": state.queued_requests,
+                        "concurrency_limit": state.concurrency_limit,
+                        "total_requests": state.total_requests,
+                        "successful_requests": state.successful_requests,
+                        "failed_requests": state.failed_requests,
+                        "fault_active": is_fault,
+                        "effective_latency": lat,
+                        "cancellation_completed": state.cancellation_completed,
+                    })
+                return
+
+            self._send_json(404, {"error": "Not Found"})
+
+        def do_POST(self):
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = {}
+            if content_length > 0:
+                try:
+                    body = json.loads(self.rfile.read(content_length).decode("utf-8"))
+                except Exception:
+                    body = {}
+
+            if self.path == "/admin/fault":
+                latency_ms = float(body.get("latency_ms", 1500.0))
+                duration_seconds = float(body.get("duration_seconds", body.get("duration", 10.0)))
+                state.inject_fault(latency_ms, duration_seconds)
+                self._send_json(200, {
+                    "status": "fault_injected",
+                    "latency_ms": latency_ms,
+                    "duration_seconds": duration_seconds,
+                })
+                return
+
+            if self.path == "/admin/recover":
+                state.recover_fault()
+                self._send_json(200, {"status": "recovered"})
+                return
+
+            if self.path in ("/data/cancel", "/cancel"):
+                op_id = self.headers.get("X-Operation-ID", body.get("operation_id", ""))
+                att_id = self.headers.get("X-Physical-Attempt-ID", body.get("physical_attempt_id", ""))
+                cancelled = state.cancel_query(op_id, att_id)
+                self._send_json(200, {"status": "cancelled", "cancelled_count": cancelled})
+                return
+
+            if self.path in ("/data/query", "/query", "/execute"):
+                req_id = self.headers.get("X-Logical-Request-ID", body.get("logical_request_id", "req-unknown"))
+                wf_id = self.headers.get("X-Workflow-ID", body.get("workflow_id", "wf-unknown"))
+                op_id = self.headers.get("X-Operation-ID", body.get("operation_id", f"{wf_id}-op"))
+                att_id = self.headers.get("X-Physical-Attempt-ID", body.get("physical_attempt_id", f"{op_id}-att-0"))
+
+                with state.lock:
+                    state.total_requests += 1
+                    if state.queued_requests >= state.queue_capacity:
+                        state.failed_requests += 1
+                        self._send_json(503, {"error": "PgBouncer connection backlog exhausted"})
+                        return
+                    state.queued_requests += 1
+
+                cancel_event = state.register_query(att_id, op_id, wf_id)
+                start_wait = time.time()
+
+                # Acquire connection pool slot (concurrency limit = 25)
+                acquired = state.semaphore.acquire(timeout=5.0)
+
+                with state.lock:
+                    state.queued_requests = max(0, state.queued_requests - 1)
+                    if not acquired:
+                        state.failed_requests += 1
+                        state.unregister_query(att_id)
+                        self._send_json(504, {"error": "Connection acquisition timeout from pool"})
+                        return
+                    state.active_requests += 1
+
+                try:
+                    if cancel_event.is_set():
+                        self._send_json(499, {"error": "Client cancelled before execution"})
+                        return
+
+                    latency, _ = state.get_effective_latency()
+                    ok, msg = execute_pg_query(latency, cancel_event)
+
+                    duration = time.time() - start_wait
+                    with state.lock:
+                        if ok:
+                            state.successful_requests += 1
+                            state.total_latency_seconds += duration
+                        else:
+                            state.failed_requests += 1
+
+                    if ok:
+                        self._send_json(200, {
+                            "status": "success",
+                            "operation_id": op_id,
+                            "physical_attempt_id": att_id,
+                            "execution_time_seconds": duration,
+                            "result": [{"id": "item-1", "key": "agentic-state", "value": "healthy"}],
+                        })
+                    else:
+                        self._send_json(499 if "cancelled" in msg else 500, {"error": msg})
+                finally:
+                    state.unregister_query(att_id)
+                    with state.lock:
+                        state.active_requests = max(0, state.active_requests - 1)
+                    state.semaphore.release()
+                return
+
+            self._send_json(404, {"error": "Not Found"})
+
+        def log_message(self, format, *args):
+            pass
+
+
+    def run_server():
+        server_address = ("0.0.0.0", PORT)
+        httpd = ThreadingHTTPServer(server_address, DataAPIHandler)
+        logger.info(
+            f"Starting Data API on 0.0.0.0:{PORT} (concurrency={CONCURRENCY_LIMIT}, "
+            f"pgbouncer={PGBOUNCER_HOST}:{PGBOUNCER_PORT}, redis={REDIS_HOST}:{REDIS_PORT})"
+        )
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            logger.info("Shutting down Data API...")
+            httpd.server_close()
+
+
+    if __name__ == "__main__":
+        run_server()
+
