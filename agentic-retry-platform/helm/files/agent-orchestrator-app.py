@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Agent Orchestrator Service for Agentic Retry Platform.
 
-Acts as the autonomous agent supervisor/planner.
-Coordinates multi-step tool execution, manages persistent workflow state
-in Redis, enforces workflow deadlines, tracks global retry budgets,
-and executes planner replanning (R_planner = 3) upon tool failure.
+Acts as autonomous agent supervisor. Coordinates multi-stage tool execution,
+manages workflow generations, handles speculative replanning upon planner timeout,
+implements uncancelled orphaned work mechanics vs cancellation propagation,
+enforces global retry budgets, and tracks durable queue leases.
 """
 
 from __future__ import annotations
@@ -27,24 +27,48 @@ logger = logging.getLogger("agent-orchestrator")
 
 PORT = int(os.environ.get("PORT", "8000"))
 TOOL_GATEWAY_URL = os.environ.get("TOOL_GATEWAY_URL", "http://tool-gateway:8001/tools/execute")
+TOOL_GATEWAY_CANCEL_URL = os.environ.get("TOOL_GATEWAY_CANCEL_URL", "http://tool-gateway:8001/tools/cancel")
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
-PLANNER_MAX_RETRIES = int(os.environ.get("PLANNER_MAX_RETRIES", "3"))  # R_planner = 3
-PLANNER_TIMEOUT = float(os.environ.get("PLANNER_TIMEOUT", "3.50"))     # 3.5s per plan attempt
-WORKFLOW_DEADLINE = float(os.environ.get("WORKFLOW_DEADLINE", "12.0")) # Stale workflow deadline
-RETRY_BUDGET = int(os.environ.get("RETRY_BUDGET", "12"))              # Configurable global budget
+POLICY_PATH = os.environ.get("POLICY_PATH", "/etc/agent-policy/policy.json")
+
+
+def load_policy() -> dict:
+    if os.path.exists(POLICY_PATH):
+        try:
+            with open(POLICY_PATH, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to read policy from {POLICY_PATH}: {e}")
+    return {
+        "workflow": {
+            "timeout_ms": 1500,
+            "max_attempts": 3,
+            "max_inflight": 100,
+            "cancel_children_on_timeout": False,
+        },
+        "queue": {
+            "visibility_timeout_ms": 2000,
+        },
+        "retry_budget": {
+            "enabled": False,
+            "max_physical_attempts_per_workflow": 4,
+        },
+    }
 
 
 class OrchestratorState:
     def __init__(self):
         self.lock = threading.Lock()
         self.logical_requests = 0
-        self.successful_workflows = 0
+        self.goodput_requests = 0
         self.failed_workflows = 0
-        self.planner_replans = 0
+        self.workflow_generations = 0
         self.active_workflows = 0
         self.total_duration_seconds = 0.0
         self.redis_backlog_count = 0
+        self.queue_redeliveries = 0
+        self.orphaned_operations = 0
         self.in_memory_queue = []
 
     def inc_active(self):
@@ -55,7 +79,7 @@ class OrchestratorState:
         with self.lock:
             self.active_workflows = max(0, self.active_workflows - 1)
             if success:
-                self.successful_workflows += 1
+                self.goodput_requests += 1
             else:
                 self.failed_workflows += 1
             self.total_duration_seconds += duration
@@ -64,88 +88,113 @@ class OrchestratorState:
 state = OrchestratorState()
 
 
-def try_redis_push(wf_id: str, payload: dict):
-    """Attempts to store workflow state in Redis; falls back to in-memory queue."""
+def dispatch_tool_cancellation(op_id: str):
+    """Sends cancellation signal to Tool Gateway to kill child operation."""
     try:
-        import socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.2)
-        s.connect((REDIS_HOST, REDIS_PORT))
-        cmd = f"*3\r\n$5\r\nRPUSH\r\n$17\r\npending_workflows\r\n${len(wf_id)}\r\n{wf_id}\r\n".encode("utf-8")
-        s.sendall(cmd)
-        s.close()
-        with state.lock:
-            state.redis_backlog_count += 1
-    except Exception:
-        with state.lock:
-            state.in_memory_queue.append(wf_id)
-            state.redis_backlog_count = len(state.in_memory_queue)
+        payload = json.dumps({"operation_id": op_id}).encode("utf-8")
+        req = urllib.request.Request(TOOL_GATEWAY_CANCEL_URL, data=payload, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("X-Operation-ID", op_id)
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            logger.info(f"Dispatched cancellation for op_id={op_id}: {resp.status}")
+    except Exception as e:
+        logger.warning(f"Failed to dispatch cancellation for op_id={op_id}: {e}")
 
 
-def execute_workflow_planner(req_id: str, wf_id: str) -> dict:
-    """Executes multi-stage agentic workflow with planner replanning."""
-    state.inc_active()
-    try_redis_push(wf_id, {"req_id": req_id, "start_time": time.time()})
+def execute_workflow(req_id: str, wf_id: str) -> dict:
+    """Executes workflow with speculative replanning and generation tracking."""
+    policy = load_policy()
+    wf_cfg = policy.get("workflow", {})
+    planner_timeout = wf_cfg.get("timeout_ms", 1500) / 1000.0
+    max_generations = wf_cfg.get("max_attempts", 3)
+    cancel_children = wf_cfg.get("cancel_children_on_timeout", False)
+    max_inflight = wf_cfg.get("max_inflight", 100)
 
-    start_time = time.time()
-    last_error = None
-    replans_used = 0
+    queue_cfg = policy.get("queue", {})
+    visibility_timeout = queue_cfg.get("visibility_timeout_ms", 2000) / 1000.0
 
+    budget_cfg = policy.get("retry_budget", {})
+    initial_budget = budget_cfg.get("max_physical_attempts_per_workflow", 4)
+
+    # Admission control check
     with state.lock:
+        if state.active_workflows >= max_inflight:
+            logger.warning(f"Admission control rejecting workflow {wf_id}: inflight={state.active_workflows}")
+            return {"status": "error", "error": "Admission control: system saturated", "code": 503}
         state.logical_requests += 1
 
-    for plan_attempt in range(PLANNER_MAX_RETRIES + 1):
-        if plan_attempt > 0:
-            with state.lock:
-                state.planner_replans += 1
-            replans_used += 1
+    state.inc_active()
+    start_time = time.time()
+    last_error = None
+    remaining_budget = initial_budget
 
-        # Check workflow deadline (stale work shedding)
-        if (time.time() - start_time) > WORKFLOW_DEADLINE:
-            last_error = f"Workflow deadline exceeded ({WORKFLOW_DEADLINE}s)"
-            logger.warning(f"Shedding stale workflow wf={wf_id} req={req_id}")
-            break
+    active_ops: list[str] = []
 
-        layer = "planner" if plan_attempt > 0 else "initial"
+    for gen in range(max_generations):
+        with state.lock:
+            state.workflow_generations += 1
+
+        op_id = f"{wf_id}-op-gen{gen}"
+        active_ops.append(op_id)
+
         payload = json.dumps({
             "logical_request_id": req_id,
             "workflow_id": wf_id,
-            "attempt": plan_attempt + 1,
-            "retry_layer": layer,
+            "operation_id": op_id,
+            "generation": gen,
+            "retry_budget": remaining_budget,
         }).encode("utf-8")
 
         req = urllib.request.Request(TOOL_GATEWAY_URL, data=payload, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("X-Logical-Request-ID", req_id)
         req.add_header("X-Workflow-ID", wf_id)
-        req.add_header("X-Attempt", str(plan_attempt + 1))
-        req.add_header("X-Retry-Layer", layer)
+        req.add_header("X-Operation-ID", op_id)
+        req.add_header("X-Generation", str(gen))
+        req.add_header("X-Retry-Budget", str(remaining_budget))
 
+        gen_start = time.time()
         try:
-            with urllib.request.urlopen(req, timeout=PLANNER_TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=planner_timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 duration = time.time() - start_time
                 state.dec_active(success=True, duration=duration)
-                logger.info(
-                    f"Workflow succeeded wf={wf_id} req={req_id} replans={replans_used} "
-                    f"duration={duration:.3f}s"
-                )
+                logger.info(f"Workflow {wf_id} succeeded at generation {gen} in {duration:.3f}s")
                 return {
                     "status": "success",
                     "logical_request_id": req_id,
                     "workflow_id": wf_id,
-                    "replans_used": replans_used,
+                    "completed_generation": gen,
                     "duration_seconds": duration,
-                    "tool_response": data,
+                    "result": data,
                 }
         except Exception as e:
+            gen_elapsed = time.time() - gen_start
             last_error = str(e)
+            is_timeout = "timed out" in str(e).lower()
+
             logger.warning(
-                f"Planner attempt {plan_attempt + 1}/{PLANNER_MAX_RETRIES + 1} failed for "
-                f"wf={wf_id}: {last_error}"
+                f"Generation {gen} (op={op_id}) failed for wf={wf_id} after {gen_elapsed:.3f}s: {last_error}"
             )
-            # Short backoff before replanning
-            time.sleep(0.05)
+
+            # Check queue lease expiration
+            if gen_elapsed > visibility_timeout:
+                with state.lock:
+                    state.queue_redeliveries += 1
+                logger.info(f"Queue lease expired for wf={wf_id} ({gen_elapsed:.3f}s > {visibility_timeout}s)")
+
+            # Speculative replanning: launch next generation
+            # If cancellation is enabled, cancel the timed-out operation
+            if cancel_children:
+                logger.info(f"Cancellation enabled: killing orphaned operation op={op_id}")
+                threading.Thread(target=dispatch_tool_cancellation, args=(op_id,), daemon=True).start()
+            else:
+                # Decoupled lifetime: operation op_id is left running in the backend as ORPHANED WORK
+                with state.lock:
+                    state.orphaned_operations += 1
+                logger.warning(f"Uncancelled operation op={op_id} continues running in background (ORPHANED WORK)")
+
+            remaining_budget = max(0, remaining_budget - 2)
 
     duration = time.time() - start_time
     state.dec_active(success=False, duration=duration)
@@ -153,10 +202,9 @@ def execute_workflow_planner(req_id: str, wf_id: str) -> dict:
         "status": "error",
         "logical_request_id": req_id,
         "workflow_id": wf_id,
-        "replans_used": replans_used,
+        "generations_attempted": max_generations,
         "duration_seconds": duration,
-        "error": f"Planner exhausted after {PLANNER_MAX_RETRIES} replans: {last_error}",
-        "last_error": last_error,
+        "error": f"Planner exhausted all {max_generations} speculative replans: {last_error}",
     }
 
 
@@ -184,26 +232,26 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
 
         if self.path == "/metrics":
             with state.lock:
-                avg_dur = state.total_duration_seconds / max(1, state.successful_workflows)
+                avg_dur = state.total_duration_seconds / max(1, state.goodput_requests)
                 metrics_text = (
-                    f"# HELP workflow_logical_requests_total Total logical workflow requests\n"
-                    f"# TYPE workflow_logical_requests_total counter\n"
-                    f"workflow_logical_requests_total {state.logical_requests}\n"
-                    f"# HELP workflow_success_total Successful workflows\n"
-                    f"# TYPE workflow_success_total counter\n"
-                    f"workflow_success_total {state.successful_workflows}\n"
-                    f"# HELP workflow_failure_total Failed workflows\n"
-                    f"# TYPE workflow_failure_total counter\n"
-                    f"workflow_failure_total {state.failed_workflows}\n"
-                    f"# HELP workflow_replans_total Total replanning events triggered by planner\n"
-                    f"# TYPE workflow_replans_total counter\n"
-                    f"workflow_replans_total {state.planner_replans}\n"
-                    f"# HELP workflow_active_count Currently running workflows\n"
+                    f"# HELP logical_workflows_total Total unique logical workflows submitted\n"
+                    f"# TYPE logical_workflows_total counter\n"
+                    f"logical_workflows_total {state.logical_requests}\n"
+                    f"# HELP goodput_requests_total Successful unique logical requests completed\n"
+                    f"# TYPE goodput_requests_total counter\n"
+                    f"goodput_requests_total {state.goodput_requests}\n"
+                    f"# HELP workflow_generation_total Total speculative replanning branches created\n"
+                    f"# TYPE workflow_generation_total counter\n"
+                    f"workflow_generation_total {state.workflow_generations}\n"
+                    f"# HELP queue_redeliveries_total Tasks redelivered due to lease expiration\n"
+                    f"# TYPE queue_redeliveries_total counter\n"
+                    f"queue_redeliveries_total {state.queue_redeliveries}\n"
+                    f"# HELP orphaned_operations_created Operations left running after planner timeout\n"
+                    f"# TYPE orphaned_operations_created counter\n"
+                    f"orphaned_operations_created {state.orphaned_operations}\n"
+                    f"# HELP workflow_active_count Currently active workflows\n"
                     f"# TYPE workflow_active_count gauge\n"
                     f"workflow_active_count {state.active_workflows}\n"
-                    f"# HELP workflow_redis_backlog Workflows tracked in persistent Redis backlog\n"
-                    f"# TYPE workflow_redis_backlog gauge\n"
-                    f"workflow_redis_backlog {state.redis_backlog_count}\n"
                     f"# HELP workflow_duration_seconds Average workflow completion duration\n"
                     f"# TYPE workflow_duration_seconds gauge\n"
                     f"workflow_duration_seconds {avg_dur:.4f}\n"
@@ -212,13 +260,7 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/config":
-            self._send_json(200, {
-                "tool_gateway_url": TOOL_GATEWAY_URL,
-                "planner_max_retries": PLANNER_MAX_RETRIES,
-                "planner_timeout": PLANNER_TIMEOUT,
-                "workflow_deadline": WORKFLOW_DEADLINE,
-                "retry_budget": RETRY_BUDGET,
-            })
+            self._send_json(200, load_policy())
             return
 
         self._send_json(404, {"error": "Not Found"})
@@ -236,11 +278,9 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             req_id = self.headers.get("X-Logical-Request-ID", body.get("logical_request_id", f"req-{time.time()}"))
             wf_id = self.headers.get("X-Workflow-ID", body.get("workflow_id", f"wf-{time.time()}"))
 
-            result = execute_workflow_planner(req_id, wf_id)
-            if result["status"] == "success":
-                self._send_json(200, result)
-            else:
-                self._send_json(504, result)
+            result = execute_workflow(req_id, wf_id)
+            code = result.get("code", 200 if result["status"] == "success" else 504)
+            self._send_json(code, result)
             return
 
         self._send_json(404, {"error": "Not Found"})
@@ -252,7 +292,7 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
 def run_server():
     server_address = ("0.0.0.0", PORT)
     httpd = ThreadingHTTPServer(server_address, OrchestratorHandler)
-    logger.info(f"Starting Agent Orchestrator on 0.0.0.0:{PORT} (tools={TOOL_GATEWAY_URL}, retries_planner={PLANNER_MAX_RETRIES}, timeout={PLANNER_TIMEOUT}s)")
+    logger.info(f"Starting Agent Orchestrator on 0.0.0.0:{PORT} (tools={TOOL_GATEWAY_URL})")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

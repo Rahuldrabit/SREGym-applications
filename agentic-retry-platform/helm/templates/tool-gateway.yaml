@@ -26,19 +26,22 @@ spec:
               value: "{{ .Values.toolGateway.port }}"
             - name: DATA_API_URL
               value: "{{ .Values.toolGateway.dataApiUrl }}"
-            - name: HTTP_TIMEOUT
-              value: "{{ .Values.toolGateway.httpTimeout }}"
-            - name: HTTP_MAX_RETRIES
-              value: "{{ .Values.toolGateway.httpMaxRetries }}"
-            - name: TOOL_MAX_RETRIES
-              value: "{{ .Values.toolGateway.toolMaxRetries }}"
+            - name: DATA_API_CANCEL_URL
+              value: "http://data-api:8002/data/cancel"
+            - name: POLICY_PATH
+              value: "/etc/agent-policy/policy.json"
           volumeMounts:
             - name: code-volume
               mountPath: /app/tool-gateway
+            - name: policy-volume
+              mountPath: /etc/agent-policy
       volumes:
         - name: code-volume
           configMap:
             name: agentic-retry-scripts
+        - name: policy-volume
+          configMap:
+            name: agentic-retry-policy
 ---
 apiVersion: v1
 kind: Service

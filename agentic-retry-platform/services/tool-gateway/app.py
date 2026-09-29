@@ -2,8 +2,8 @@
 """Tool Gateway Service for Agentic Retry Platform.
 
 Executes autonomous agent tool calls by delegating to Data API.
-Enforces timeouts (600ms), HTTP transport retries (R_http = 2),
-tool-level retries (R_tool = 2), circuit breaking, and trace header propagation.
+Enforces timeout hierarchy, tool-level retries, HTTP transport retries,
+cancellation propagation (POST /tools/cancel), and end-to-end retry budget tracking.
 """
 
 from __future__ import annotations
@@ -26,133 +26,152 @@ logger = logging.getLogger("tool-gateway")
 
 PORT = int(os.environ.get("PORT", "8001"))
 DATA_API_URL = os.environ.get("DATA_API_URL", "http://data-api:8002/data/query")
-HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "0.60"))         # 600ms per attempt
-HTTP_MAX_RETRIES = int(os.environ.get("HTTP_MAX_RETRIES", "2"))     # R_http = 2
-TOOL_MAX_RETRIES = int(os.environ.get("TOOL_MAX_RETRIES", "2"))     # R_tool = 2
+DATA_API_CANCEL_URL = os.environ.get("DATA_API_CANCEL_URL", "http://data-api:8002/data/cancel")
+POLICY_PATH = os.environ.get("POLICY_PATH", "/etc/agent-policy/policy.json")
+
+
+def load_policy() -> dict:
+    if os.path.exists(POLICY_PATH):
+        try:
+            with open(POLICY_PATH, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to read policy from {POLICY_PATH}: {e}")
+    return {
+        "tool": {"timeout_ms": 1400, "max_attempts": 2},
+        "transport": {"timeout_ms": 1200, "max_attempts": 2},
+        "retry_budget": {"enabled": False, "max_physical_attempts_per_workflow": 4},
+    }
 
 
 class ToolGatewayMetrics:
     def __init__(self):
         self.lock = threading.Lock()
-        self.tool_requests = 0
-        self.tool_successes = 0
-        self.tool_failures = 0
+        self.operations_started = 0
+        self.operations_completed = 0
+        self.unique_operations: set[str] = set()
         self.tool_retries = 0
         self.http_attempts = 0
         self.http_timeouts = 0
-        self.circuit_breaker_state = "closed"  # closed, open, half_open
-        self.consecutive_failures = 0
-        self.cb_failure_threshold = 15
-        self.cb_reset_timeout = 5.0
-        self.cb_opened_at = 0.0
-
-    def record_attempt(self, success: bool, is_timeout: bool = False):
-        with self.lock:
-            self.http_attempts += 1
-            if is_timeout:
-                self.http_timeouts += 1
-            if success:
-                self.consecutive_failures = 0
-                if self.circuit_breaker_state == "half_open":
-                    self.circuit_breaker_state = "closed"
-            else:
-                self.consecutive_failures += 1
-                if self.consecutive_failures >= self.cb_failure_threshold and self.circuit_breaker_state == "closed":
-                    self.circuit_breaker_state = "open"
-                    self.cb_opened_at = time.time()
-                    logger.warning(f"Circuit breaker tripped OPEN after {self.consecutive_failures} consecutive failures")
-
-    def check_circuit_breaker(self) -> bool:
-        """Returns True if request is allowed, False if blocked by circuit breaker."""
-        with self.lock:
-            if self.circuit_breaker_state == "closed":
-                return True
-            if self.circuit_breaker_state == "open":
-                if time.time() - self.cb_opened_at > self.cb_reset_timeout:
-                    self.circuit_breaker_state = "half_open"
-                    logger.info("Circuit breaker entering HALF_OPEN probe state")
-                    return True
-                return False
-            # half_open allows probe
-            return True
+        self.cancellations_forwarded = 0
+        self.budget_exhausted_total = 0
 
 
 metrics = ToolGatewayMetrics()
 
 
-def execute_http_call(req_id: str, wf_id: str, attempt: int, layer: str) -> dict:
-    """Executes single HTTP call to Data API with timeout."""
+def forward_cancellation(op_id: str):
+    """Sends cancellation request downstream to Data API."""
+    try:
+        payload = json.dumps({"operation_id": op_id}).encode("utf-8")
+        req = urllib.request.Request(DATA_API_CANCEL_URL, data=payload, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("X-Operation-ID", op_id)
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            logger.info(f"Forwarded cancellation for op_id={op_id}: {resp.status}")
+        with metrics.lock:
+            metrics.cancellations_forwarded += 1
+    except Exception as e:
+        logger.warning(f"Failed to forward cancellation for {op_id}: {e}")
+
+
+def execute_http_call(req_id: str, wf_id: str, op_id: str, gen: int, attempt: int, layer: str, budget: int) -> dict:
+    policy = load_policy()
+    transport_timeout = policy.get("transport", {}).get("timeout_ms", 1200) / 1000.0
+
     payload = json.dumps({
         "logical_request_id": req_id,
         "workflow_id": wf_id,
+        "operation_id": op_id,
+        "generation": gen,
         "attempt": attempt,
         "retry_layer": layer,
+        "retry_budget": budget,
     }).encode("utf-8")
 
     req = urllib.request.Request(DATA_API_URL, data=payload, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("X-Logical-Request-ID", req_id)
     req.add_header("X-Workflow-ID", wf_id)
+    req.add_header("X-Operation-ID", op_id)
+    req.add_header("X-Generation", str(gen))
     req.add_header("X-Attempt", str(attempt))
     req.add_header("X-Retry-Layer", layer)
+    req.add_header("X-Retry-Budget", str(budget))
 
     start = time.time()
+    with metrics.lock:
+        metrics.http_attempts += 1
+
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=transport_timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            metrics.record_attempt(success=True)
             return {"status": "ok", "latency": time.time() - start, "data": data}
     except urllib.error.HTTPError as e:
-        metrics.record_attempt(success=False)
         return {"status": "error", "error": f"HTTP {e.code}", "latency": time.time() - start}
     except Exception as e:
         is_to = "timed out" in str(e).lower()
-        metrics.record_attempt(success=False, is_timeout=is_to)
+        if is_to:
+            with metrics.lock:
+                metrics.http_timeouts += 1
         return {"status": "error", "error": str(e), "is_timeout": is_to, "latency": time.time() - start}
 
 
-def execute_tool_with_retries(req_id: str, wf_id: str, planner_attempt: int) -> dict:
-    """Executes tool with nested R_tool retries and R_http transport retries."""
-    if not metrics.check_circuit_breaker():
-        return {
-            "status": "error",
-            "error": "Circuit breaker OPEN: shedding load to allow downstream recovery",
-            "circuit_breaker": "open",
-        }
+def execute_tool_operation(req_id: str, wf_id: str, op_id: str, gen: int, budget: int) -> dict:
+    policy = load_policy()
+    tool_retries = policy.get("tool", {}).get("max_attempts", 2)
+    http_retries = policy.get("transport", {}).get("max_attempts", 2)
+    budget_enabled = policy.get("retry_budget", {}).get("enabled", False)
 
     with metrics.lock:
-        metrics.tool_requests += 1
+        metrics.operations_started += 1
+        metrics.unique_operations.add(op_id)
 
+    curr_budget = budget
     last_error = None
-    for tool_try in range(TOOL_MAX_RETRIES + 1):
+
+    for tool_try in range(tool_retries + 1):
         if tool_try > 0:
             with metrics.lock:
                 metrics.tool_retries += 1
 
         layer = "tool" if tool_try > 0 else "initial"
 
-        # Inner transport retry loop (R_http)
-        for http_try in range(HTTP_MAX_RETRIES + 1):
+        for http_try in range(http_retries + 1):
+            if budget_enabled and curr_budget <= 0:
+                with metrics.lock:
+                    metrics.budget_exhausted_total += 1
+                logger.warning(f"Retry budget exhausted ({budget}) for wf={wf_id} op={op_id}")
+                return {
+                    "status": "error",
+                    "error": "Global retry budget exhausted",
+                    "budget_exhausted": True,
+                }
+
+            curr_budget -= 1
             http_layer = "transport" if http_try > 0 else layer
-            res = execute_http_call(req_id, wf_id, tool_try * (HTTP_MAX_RETRIES + 1) + http_try + 1, http_layer)
+            res = execute_http_call(req_id, wf_id, op_id, gen, tool_try * 3 + http_try + 1, http_layer, curr_budget)
+
             if res["status"] == "ok":
                 with metrics.lock:
-                    metrics.tool_successes += 1
+                    metrics.operations_completed += 1
                 return {
                     "status": "success",
-                    "tool_retries_used": tool_try,
-                    "http_retries_used": http_try,
+                    "operation_id": op_id,
+                    "generation": gen,
+                    "tool_retries": tool_try,
+                    "http_retries": http_try,
+                    "remaining_budget": curr_budget,
                     "result": res["data"],
                 }
-            last_error = res.get("error", "unknown error")
-
-    with metrics.lock:
-        metrics.tool_failures += 1
+            last_error = res.get("error", "timeout")
 
     return {
         "status": "error",
-        "error": f"Tool execution failed after {TOOL_MAX_RETRIES} tool retries: {last_error}",
-        "last_error": last_error,
+        "operation_id": op_id,
+        "generation": gen,
+        "error": f"Tool execution failed: {last_error}",
+        "remaining_budget": curr_budget,
     }
 
 
@@ -181,32 +200,33 @@ class ToolGatewayHandler(BaseHTTPRequestHandler):
         if self.path == "/metrics":
             with metrics.lock:
                 metrics_text = (
-                    f"# HELP tool_requests_total Total logical tool requests received\n"
-                    f"# TYPE tool_requests_total counter\n"
-                    f"tool_requests_total {metrics.tool_requests}\n"
+                    f"# HELP tool_operations_started_total Total tool operations started\n"
+                    f"# TYPE tool_operations_started_total counter\n"
+                    f"tool_operations_started_total {metrics.operations_started}\n"
+                    f"# HELP tool_operations_completed_total Successfully completed tool operations\n"
+                    f"# TYPE tool_operations_completed_total counter\n"
+                    f"tool_operations_completed_total {metrics.operations_completed}\n"
+                    f"# HELP unique_operation_ids_total Unique operation IDs handled\n"
+                    f"# TYPE unique_operation_ids_total counter\n"
+                    f"unique_operation_ids_total {len(metrics.unique_operations)}\n"
                     f"# HELP tool_retries_total Retries executed at tool level\n"
                     f"# TYPE tool_retries_total counter\n"
                     f"tool_retries_total {metrics.tool_retries}\n"
-                    f"# HELP tool_timeouts_total Downstream HTTP timeouts experienced by tool gateway\n"
-                    f"# TYPE tool_timeouts_total counter\n"
-                    f"tool_timeouts_total {metrics.http_timeouts}\n"
-                    f"# HELP tool_http_attempts_total Total HTTP calls dispatched to data API\n"
+                    f"# HELP tool_http_attempts_total Total HTTP calls to Data API\n"
                     f"# TYPE tool_http_attempts_total counter\n"
                     f"tool_http_attempts_total {metrics.http_attempts}\n"
-                    f"# HELP tool_circuit_breaker_tripped Whether circuit breaker is open (1) or closed (0)\n"
-                    f"# TYPE tool_circuit_breaker_tripped gauge\n"
-                    f"tool_circuit_breaker_tripped {1 if metrics.circuit_breaker_state == 'open' else 0}\n"
+                    f"# HELP tool_cancellations_forwarded Cancellations forwarded to Data API\n"
+                    f"# TYPE tool_cancellations_forwarded counter\n"
+                    f"tool_cancellations_forwarded {metrics.cancellations_forwarded}\n"
+                    f"# HELP retry_budget_exhausted_total Invocations blocked by retry budget\n"
+                    f"# TYPE retry_budget_exhausted_total counter\n"
+                    f"retry_budget_exhausted_total {metrics.budget_exhausted_total}\n"
                 )
             self._send_text(200, metrics_text, "text/plain; version=0.0.4")
             return
 
         if self.path == "/config":
-            self._send_json(200, {
-                "data_api_url": DATA_API_URL,
-                "http_timeout": HTTP_TIMEOUT,
-                "http_max_retries": HTTP_MAX_RETRIES,
-                "tool_max_retries": TOOL_MAX_RETRIES,
-            })
+            self._send_json(200, load_policy())
             return
 
         self._send_json(404, {"error": "Not Found"})
@@ -220,16 +240,22 @@ class ToolGatewayHandler(BaseHTTPRequestHandler):
             except Exception:
                 body = {}
 
+        if self.path in ("/tools/cancel", "/cancel"):
+            op_id = self.headers.get("X-Operation-ID", body.get("operation_id", ""))
+            threading.Thread(target=forward_cancellation, args=(op_id,), daemon=True).start()
+            self._send_json(200, {"status": "cancellation_dispatched", "operation_id": op_id})
+            return
+
         if self.path in ("/tools/execute", "/execute"):
             req_id = self.headers.get("X-Logical-Request-ID", body.get("logical_request_id", "req-unknown"))
             wf_id = self.headers.get("X-Workflow-ID", body.get("workflow_id", "wf-unknown"))
-            attempt = int(self.headers.get("X-Attempt", body.get("attempt", 1)))
+            op_id = self.headers.get("X-Operation-ID", body.get("operation_id", f"{wf_id}-op"))
+            gen = int(self.headers.get("X-Generation", body.get("generation", 0)))
+            budget = int(self.headers.get("X-Retry-Budget", body.get("retry_budget", 4)))
 
-            result = execute_tool_with_retries(req_id, wf_id, attempt)
+            result = execute_tool_operation(req_id, wf_id, op_id, gen, budget)
             if result["status"] == "success":
                 self._send_json(200, result)
-            elif result.get("circuit_breaker") == "open":
-                self._send_json(503, result)
             else:
                 self._send_json(504, result)
             return
@@ -243,7 +269,7 @@ class ToolGatewayHandler(BaseHTTPRequestHandler):
 def run_server():
     server_address = ("0.0.0.0", PORT)
     httpd = ThreadingHTTPServer(server_address, ToolGatewayHandler)
-    logger.info(f"Starting Tool Gateway on 0.0.0.0:{PORT} (data_api={DATA_API_URL}, timeout={HTTP_TIMEOUT}s, retries_tool={TOOL_MAX_RETRIES}, retries_http={HTTP_MAX_RETRIES})")
+    logger.info(f"Starting Tool Gateway on 0.0.0.0:{PORT} (data_api={DATA_API_URL})")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

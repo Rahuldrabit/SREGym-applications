@@ -26,25 +26,26 @@ spec:
               value: "{{ .Values.agentOrchestrator.port }}"
             - name: TOOL_GATEWAY_URL
               value: "{{ .Values.agentOrchestrator.toolGatewayUrl }}"
+            - name: TOOL_GATEWAY_CANCEL_URL
+              value: "http://tool-gateway:8001/tools/cancel"
             - name: REDIS_HOST
               value: "{{ .Values.agentOrchestrator.redisHost }}"
             - name: REDIS_PORT
               value: "{{ .Values.agentOrchestrator.redisPort }}"
-            - name: PLANNER_TIMEOUT
-              value: "{{ .Values.agentOrchestrator.plannerTimeout }}"
-            - name: PLANNER_MAX_RETRIES
-              value: "{{ .Values.agentOrchestrator.plannerMaxRetries }}"
-            - name: WORKFLOW_DEADLINE
-              value: "{{ .Values.agentOrchestrator.workflowDeadline }}"
-            - name: RETRY_BUDGET
-              value: "{{ .Values.agentOrchestrator.retryBudget }}"
+            - name: POLICY_PATH
+              value: "/etc/agent-policy/policy.json"
           volumeMounts:
             - name: code-volume
               mountPath: /app/agent-orchestrator
+            - name: policy-volume
+              mountPath: /etc/agent-policy
       volumes:
         - name: code-volume
           configMap:
             name: agentic-retry-scripts
+        - name: policy-volume
+          configMap:
+            name: agentic-retry-policy
 ---
 apiVersion: v1
 kind: Service

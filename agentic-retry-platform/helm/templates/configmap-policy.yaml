@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentic-retry-policy
+  labels:
+    app: agentic-retry-platform
+data:
+  policy.json: |
+    {
+      "workflow": {
+        "timeout_ms": 1500,
+        "max_attempts": 3,
+        "max_inflight": 100,
+        "cancel_children_on_timeout": false
+      },
+      "tool": {
+        "timeout_ms": 1400,
+        "max_attempts": 2
+      },
+      "transport": {
+        "timeout_ms": 1200,
+        "max_attempts": 2
+      },
+      "queue": {
+        "visibility_timeout_ms": 2000,
+        "enable_lease_renewal": false
+      },
+      "retry_budget": {
+        "enabled": false,
+        "max_physical_attempts_per_workflow": 4
+      }
+    }
