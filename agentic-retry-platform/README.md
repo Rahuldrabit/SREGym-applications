@@ -7,9 +7,9 @@ An enterprise-grade autonomous agent platform designed for SREGym to model compo
 The system features:
 - **Agent Orchestrator** (2 replicas): High-level planner & supervisor that schedules tasks, manages persistent workflow state in Redis, enforces deadlines, and replans ($R_p = 3$) on tool failure.
 - **Tool Gateway** (2 replicas): Manages tool execution, enforces deadlines ($600\text{ms}$), executes tool retries ($R_t = 2$), HTTP transport retries ($R_h = 2$), and circuit breaking.
-- **Data API** (2 replicas): Knowledge base query service exposing administrative fault injection (`POST /admin/fault`), queueing, and metrics.
+- **Data API** (1 replica by default): Knowledge base query service exposing administrative fault injection (`POST /admin/fault`), queueing, and metrics.
 - **PgBouncer & PostgreSQL**: Models physical database connection pool saturation ($C = 25$).
-- **Redis**: Persistent workflow queue and retry backlog ensuring `restart pod != recovery`.
+- **Redis**: Durable workflow metadata and the authoritative per-workflow retry budget.
 
 ## Metastable Overload Dynamics
 

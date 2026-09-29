@@ -29,6 +29,13 @@ spec:
               value: "trust"
           ports:
             - containerPort: {{ .Values.postgres.port }}
+          volumeMounts:
+            - name: schema
+              mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: schema
+          configMap:
+            name: agentic-retry-postgres-schema
 ---
 apiVersion: v1
 kind: Service

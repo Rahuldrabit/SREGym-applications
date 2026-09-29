@@ -90,6 +90,12 @@ data:
                 return self.execute("SET", key, val, "EX", ex) is not None
             return self.execute("SET", key, val) is not None
 
+        def setnx(self, key: str, val: str, ex: int | None = None) -> bool:
+            args = ["SET", key, val, "NX"]
+            if ex:
+                args.extend(["EX", ex])
+            return self.execute(*args) == "OK"
+
         def decr(self, key: str) -> int | None:
             res = self.execute("DECR", key)
             return int(res) if isinstance(res, int) else None
@@ -211,9 +217,15 @@ data:
                 "created_at": time.time(),
             },
         )
-        redis_client.rpush("queue:pending", wf_id)
-        if budget_enabled:
-            redis_client.set(f"workflow:{wf_id}:retry_budget", str(initial_budget), ex=300)
+        if budget_enabled and not redis_client.setnx(
+            f"workflow:{wf_id}:retry_budget", str(initial_budget), ex=300
+        ):
+            state.dec_active(success=False, duration=time.time() - start_time)
+            return {
+                "status": "error",
+                "code": 503,
+                "error": "Retry budget unavailable or workflow already initialized",
+            }
 
         active_ops: list[str] = []
         last_error = None
@@ -587,7 +599,7 @@ data:
             for http_try in range(http_attempts):
                 if budget_enabled:
                     rem = redis_client.decr(f"workflow:{wf_id}:retry_budget")
-                    if rem is not None and rem < 0:
+                    if rem is None or rem < 0:
                         with metrics.lock:
                             metrics.budget_exhausted_total += 1
                         logger.warning(f"Global retry budget exhausted for wf={wf_id} op={op_id}")
@@ -826,68 +838,52 @@ data:
 
 
     def execute_pg_query(latency_seconds: float, cancel_event: threading.Event) -> tuple[bool, str]:
-        """Executes SELECT pg_sleep(...) via PgBouncer or Postgres using pure Python v3.0 wire protocol."""
-        target_hosts = [(PGBOUNCER_HOST, PGBOUNCER_PORT), (POSTGRES_HOST, POSTGRES_PORT)]
-        for host, port in target_hosts:
-            try:
-                sock = socket.create_connection((host, port), timeout=max(2.0, latency_seconds + 3.0))
-                try:
-                    # StartupMessage: len (int32), protocol version 196608 (int32), params
-                    payload = b"user\x00postgres\x00database\x00agentic_db\x00\x00"
-                    msg_len = 4 + 4 + len(payload)
-                    sock.sendall(struct.pack("!II", msg_len, 196608) + payload)
+        """Execute the workload query through PgBouncer; unavailable DBs are real failures."""
+        try:
+            sock = socket.create_connection(
+                (PGBOUNCER_HOST, PGBOUNCER_PORT), timeout=max(2.0, latency_seconds + 3.0)
+            )
+            payload = b"user\x00postgres\x00database\x00agentic_db\x00\x00"
+            msg_len = 4 + 4 + len(payload)
+            sock.sendall(struct.pack("!II", msg_len, 196608) + payload)
 
-                    # Wait for ReadyForQuery 'Z'
-                    while True:
-                        mtype = sock.recv(1)
-                        if not mtype:
-                            break
-                        mlen = struct.unpack("!I", sock.recv(4))[0]
-                        body = sock.recv(mlen - 4) if mlen > 4 else b""
-                        if mtype == b"Z":
-                            break
-                        if mtype == b"E":
-                            logger.debug(f"Postgres auth/error: {body}")
+            while True:
+                mtype = sock.recv(1)
+                if not mtype:
+                    return False, "PgBouncer closed the startup connection"
+                mlen = struct.unpack("!I", sock.recv(4))[0]
+                body = sock.recv(mlen - 4) if mlen > 4 else b""
+                if mtype == b"Z":
+                    break
+                if mtype == b"E":
+                    return False, f"PostgreSQL startup/query error: {body!r}"
 
-                    # Send Query 'Q': SELECT pg_sleep(latency_seconds), id, key, value FROM knowledge LIMIT 1;
-                    sql = f"SELECT pg_sleep({latency_seconds:.4f}), id, key, value FROM knowledge LIMIT 1;\x00".encode("utf-8")
-                    sock.sendall(b"Q" + struct.pack("!I", 4 + len(sql)) + sql)
-
-                    # Poll response or cancel
-                    sock.settimeout(0.1)
-                    start_q = time.time()
-                    while time.time() - start_q < latency_seconds + 5.0:
-                        if cancel_event.is_set():
-                            sock.close()
-                            return False, "Query cancelled during execution"
-                        try:
-                            mtype = sock.recv(1)
-                            if mtype == b"Z":
-                                # ReadyForQuery: success!
-                                sock.close()
-                                return True, "ok"
-                        except socket.timeout:
-                            continue
-                        except Exception:
-                            break
-
+            sql = (
+                f"SELECT pg_sleep({latency_seconds:.4f}), id, key, value "
+                "FROM knowledge WHERE id = 1;\x00"
+            ).encode("utf-8")
+            sock.sendall(b"Q" + struct.pack("!I", 4 + len(sql)) + sql)
+            sock.settimeout(0.1)
+            while True:
+                if cancel_event.is_set():
                     sock.close()
-                    return True, "ok"
-                except Exception:
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM):
+                    return False, "Query cancelled during execution"
+                try:
+                    mtype = sock.recv(1)
+                    if not mtype:
+                        return False, "PgBouncer closed the query connection"
+                    mlen = struct.unpack("!I", sock.recv(4))[0]
+                    body = sock.recv(mlen - 4)
+                    if mtype == b"E":
                         sock.close()
-            except Exception:
-                continue
-
-        # Fallback simulation if cluster database is booting
-        sleep_slice = 0.05
-        elapsed = 0.0
-        while elapsed < latency_seconds:
-            if cancel_event.is_set():
-                return False, "Query cancelled during execution"
-            time.sleep(min(sleep_slice, latency_seconds - elapsed))
-            elapsed += sleep_slice
-        return True, "ok"
+                        return False, f"PostgreSQL query error: {body!r}"
+                    if mtype == b"Z":
+                        sock.close()
+                        return True, "ok"
+                except socket.timeout:
+                    continue
+        except Exception as exc:
+            return False, f"PgBouncer query failed: {exc}"
 
 
     class DataAPIState:
