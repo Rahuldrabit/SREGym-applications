@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tool-gateway
+  labels:
+    app: tool-gateway
+spec:
+  replicas: {{ .Values.toolGateway.replicaCount }}
+  selector:
+    matchLabels:
+      app: tool-gateway
+  template:
+    metadata:
+      labels:
+        app: tool-gateway
+    spec:
+      containers:
+        - name: tool-gateway
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "/app/tool-gateway/tool-gateway-app.py"]
+          ports:
+            - containerPort: {{ .Values.toolGateway.port }}
+          env:
+            - name: PORT
+              value: "{{ .Values.toolGateway.port }}"
+            - name: DATA_API_URL
+              value: "{{ .Values.toolGateway.dataApiUrl }}"
+            - name: HTTP_TIMEOUT
+              value: "{{ .Values.toolGateway.httpTimeout }}"
+            - name: HTTP_MAX_RETRIES
+              value: "{{ .Values.toolGateway.httpMaxRetries }}"
+            - name: TOOL_MAX_RETRIES
+              value: "{{ .Values.toolGateway.toolMaxRetries }}"
+          volumeMounts:
+            - name: code-volume
+              mountPath: /app/tool-gateway
+      volumes:
+        - name: code-volume
+          configMap:
+            name: agentic-retry-scripts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tool-gateway
+  labels:
+    app: tool-gateway
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.toolGateway.port }}
+      targetPort: {{ .Values.toolGateway.port }}
+      name: http
+  selector:
+    app: tool-gateway

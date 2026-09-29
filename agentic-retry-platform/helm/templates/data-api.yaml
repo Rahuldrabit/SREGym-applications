@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-api
+  labels:
+    app: data-api
+spec:
+  replicas: {{ .Values.dataApi.replicaCount }}
+  selector:
+    matchLabels:
+      app: data-api
+  template:
+    metadata:
+      labels:
+        app: data-api
+    spec:
+      containers:
+        - name: data-api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "/app/data-api/data-api-app.py"]
+          ports:
+            - containerPort: {{ .Values.dataApi.port }}
+          env:
+            - name: PORT
+              value: "{{ .Values.dataApi.port }}"
+            - name: CONCURRENCY_LIMIT
+              value: "{{ .Values.dataApi.concurrencyLimit }}"
+            - name: QUEUE_CAPACITY
+              value: "{{ .Values.dataApi.queueCapacity }}"
+            - name: NORMAL_LATENCY
+              value: "{{ .Values.dataApi.normalLatency }}"
+            - name: FAULT_LATENCY
+              value: "{{ .Values.dataApi.faultLatency }}"
+          volumeMounts:
+            - name: code-volume
+              mountPath: /app/data-api
+      volumes:
+        - name: code-volume
+          configMap:
+            name: agentic-retry-scripts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-api
+  labels:
+    app: data-api
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.dataApi.port }}
+      targetPort: {{ .Values.dataApi.port }}
+      name: http
+  selector:
+    app: data-api

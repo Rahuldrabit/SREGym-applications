@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentic-retry-scripts
+data:
+  agent-orchestrator-app.py: |
+{{ .Files.Get "files/agent-orchestrator-app.py" | indent 4 }}
+  tool-gateway-app.py: |
+{{ .Files.Get "files/tool-gateway-app.py" | indent 4 }}
+  data-api-app.py: |
+{{ .Files.Get "files/data-api-app.py" | indent 4 }}
