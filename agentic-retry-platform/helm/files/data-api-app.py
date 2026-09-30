@@ -247,6 +247,14 @@ class DataAPIState:
 state = DataAPIState()
 
 
+def _tcp_dependency_ready(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
 class DataAPIHandler(BaseHTTPRequestHandler):
     def _send_json(self, status_code: int, data: dict):
         body = json.dumps(data).encode("utf-8")
@@ -267,6 +275,17 @@ class DataAPIHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/healthz", "/"):
             self._send_json(200, {"status": "ok", "service": "data-api"})
+            return
+
+        if self.path == "/readyz":
+            dependencies_ready = all(
+                _tcp_dependency_ready(host, port)
+                for host, port in ((REDIS_HOST, REDIS_PORT), (PGBOUNCER_HOST, PGBOUNCER_PORT))
+            )
+            self._send_json(
+                200 if dependencies_ready else 503,
+                {"status": "ready" if dependencies_ready else "dependencies_unavailable", "service": "data-api"},
+            )
             return
 
         if self.path == "/metrics":
@@ -294,12 +313,12 @@ class DataAPIHandler(BaseHTTPRequestHandler):
                     f"# HELP backend_waiting_requests Currently queued requests awaiting connection pool\n"
                     f"# TYPE backend_waiting_requests gauge\n"
                     f"backend_waiting_requests {state.queued_requests}\n"
-                    f"# HELP pgbouncer_used_connections Active PgBouncer connections\n"
-                    f"# TYPE pgbouncer_used_connections gauge\n"
-                    f"pgbouncer_used_connections {state.active_requests}\n"
-                    f"# HELP pgbouncer_waiting_clients Clients waiting for a PgBouncer connection slot\n"
-                    f"# TYPE pgbouncer_waiting_clients gauge\n"
-                    f"pgbouncer_waiting_clients {state.queued_requests}\n"
+                    f"# HELP data_api_active_requests Requests executing in the Data API worker pool\n"
+                    f"# TYPE data_api_active_requests gauge\n"
+                    f"data_api_active_requests {state.active_requests}\n"
+                    f"# HELP data_api_waiting_requests Requests waiting for the Data API worker pool\n"
+                    f"# TYPE data_api_waiting_requests gauge\n"
+                    f"data_api_waiting_requests {state.queued_requests}\n"
                     f"# HELP orphaned_operations_active In-flight operations continuing after caller timeout\n"
                     f"# TYPE orphaned_operations_active gauge\n"
                     f"orphaned_operations_active {orphaned_count}\n"

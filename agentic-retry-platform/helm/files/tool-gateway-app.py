@@ -123,9 +123,13 @@ def execute_http_call(
     gen: int,
     physical_attempt_id: str,
     layer: str,
+    deadline: float,
 ) -> dict:
     policy = load_policy()
     transport_timeout = policy.get("transport", {}).get("timeout_ms", 600) / 1000.0
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return {"status": "error", "error": "Tool deadline exhausted", "is_timeout": True, "latency": 0.0}
 
     payload = json.dumps({
         "logical_request_id": req_id,
@@ -150,7 +154,7 @@ def execute_http_call(
         metrics.http_attempts += 1
 
     try:
-        with urllib.request.urlopen(req, timeout=transport_timeout) as resp:
+        with urllib.request.urlopen(req, timeout=min(transport_timeout, remaining)) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return {"status": "ok", "latency": time.time() - start, "data": data}
     except urllib.error.HTTPError as e:
@@ -166,6 +170,7 @@ def execute_http_call(
 def execute_tool_operation(req_id: str, wf_id: str, op_id: str, gen: int) -> dict:
     policy = load_policy()
     tool_attempts = policy.get("tool", {}).get("max_attempts", 2)
+    tool_timeout = policy.get("tool", {}).get("timeout_ms", 1000) / 1000.0
     http_attempts = policy.get("transport", {}).get("max_attempts", 2)
     budget_enabled = policy.get("retry_budget", {}).get("enabled", False)
 
@@ -174,6 +179,7 @@ def execute_tool_operation(req_id: str, wf_id: str, op_id: str, gen: int) -> dic
         metrics.unique_operations.add(op_id)
 
     last_error = None
+    deadline = time.monotonic() + tool_timeout
 
     for tool_try in range(tool_attempts):
         if tool_try > 0:
@@ -183,6 +189,8 @@ def execute_tool_operation(req_id: str, wf_id: str, op_id: str, gen: int) -> dic
         layer = "tool" if tool_try > 0 else "initial"
 
         for http_try in range(http_attempts):
+            if time.monotonic() >= deadline:
+                return {"status": "error", "operation_id": op_id, "error": "Tool deadline exhausted"}
             if budget_enabled:
                 rem = redis_client.decr(f"workflow:{wf_id}:retry_budget")
                 if rem is not None and rem < 0:
@@ -197,7 +205,7 @@ def execute_tool_operation(req_id: str, wf_id: str, op_id: str, gen: int) -> dic
 
             http_layer = "transport" if http_try > 0 else layer
             physical_attempt_id = f"{op_id}-t{tool_try}-h{http_try}"
-            res = execute_http_call(req_id, wf_id, op_id, gen, physical_attempt_id, http_layer)
+            res = execute_http_call(req_id, wf_id, op_id, gen, physical_attempt_id, http_layer, deadline)
 
             if res["status"] == "ok":
                 with metrics.lock:
@@ -240,6 +248,16 @@ class ToolGatewayHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/healthz", "/"):
             self._send_json(200, {"status": "ok", "service": "tool-gateway"})
+            return
+
+        if self.path == "/readyz":
+            data_api_ready_url = DATA_API_URL.rsplit("/data/", 1)[0] + "/readyz"
+            try:
+                with socket.create_connection((REDIS_HOST, REDIS_PORT), timeout=0.5), urllib.request.urlopen(data_api_ready_url, timeout=0.5):
+                    pass
+                self._send_json(200, {"status": "ready", "service": "tool-gateway"})
+            except (OSError, urllib.error.URLError):
+                self._send_json(503, {"status": "dependencies_unavailable", "service": "tool-gateway"})
             return
 
         if self.path == "/metrics":

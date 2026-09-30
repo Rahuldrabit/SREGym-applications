@@ -6,7 +6,9 @@ image:
   tag: "3.11-slim"
 
 agentOrchestrator:
-  replicaCount: 2
+  # Metrics are scraped through a Service port-forward. Keep this at one until
+  # the benchmark has a replica-aware Prometheus aggregation path.
+  replicaCount: 1
   port: 8000
   resources:
     limits:
@@ -17,7 +19,7 @@ agentOrchestrator:
       memory: 128Mi
 
 toolGateway:
-  replicaCount: 2
+  replicaCount: 1
   port: 8001
   resources:
     limits:
@@ -63,8 +65,10 @@ pgbouncer:
   image:
     repository: edoburu/pgbouncer
     pullPolicy: IfNotPresent
-    tag: "v1.22.0"
-  port: 6432
+    tag: "1.22.0-p0"
+  # edoburu/pgbouncer listens on PostgreSQL's standard port; the Kubernetes
+  # Service name, rather than a non-default container port, distinguishes it.
+  port: 5432
   poolMode: transaction
   defaultPoolSize: 25
   maxClientConn: 200

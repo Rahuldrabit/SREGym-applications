@@ -320,6 +320,16 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "service": "agent-orchestrator"})
             return
 
+        if self.path == "/readyz":
+            gateway_ready_url = TOOL_GATEWAY_URL.rsplit("/tools/", 1)[0] + "/readyz"
+            try:
+                with socket.create_connection((REDIS_HOST, REDIS_PORT), timeout=0.5), urllib.request.urlopen(gateway_ready_url, timeout=0.5):
+                    pass
+                self._send_json(200, {"status": "ready", "service": "agent-orchestrator"})
+            except (OSError, urllib.error.URLError):
+                self._send_json(503, {"status": "dependencies_unavailable", "service": "agent-orchestrator"})
+            return
+
         if self.path == "/metrics":
             with state.lock:
                 avg_dur = state.total_duration_seconds / max(1, state.goodput_requests)

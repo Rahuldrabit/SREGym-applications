@@ -32,6 +32,18 @@ spec:
               value: "{{ .Values.dataApi.normalLatency }}"
             - name: FAULT_LATENCY
               value: "{{ .Values.dataApi.faultLatency }}"
+            - name: PGBOUNCER_HOST
+              value: "pgbouncer"
+            - name: PGBOUNCER_PORT
+              value: "{{ .Values.pgbouncer.port }}"
+            - name: POSTGRES_HOST
+              value: "postgres"
+            - name: POSTGRES_PORT
+              value: "{{ .Values.postgres.port }}"
+            - name: REDIS_HOST
+              value: "redis"
+            - name: REDIS_PORT
+              value: "{{ .Values.redis.port }}"
             - name: POLICY_PATH
               value: "/etc/agent-policy/policy.json"
           volumeMounts:
@@ -39,6 +51,13 @@ spec:
               mountPath: /app/data-api
             - name: policy-volume
               mountPath: /etc/agent-policy
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.dataApi.port }}
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 10
       volumes:
         - name: code-volume
           configMap:

@@ -1,18 +1,17 @@
 # Agentic Retry Platform
 
-An enterprise-grade autonomous agent platform designed for SREGym to model compounded multi-layer retry amplification and metastable overload.
+An autonomous-agent benchmark application for SREGym that models compounded, multi-layer retry amplification and metastable overload.
 
 ## Architecture
 
-The system features:
-- **Agent Orchestrator** (2 replicas): High-level planner & supervisor that schedules tasks, manages persistent workflow state in Redis, enforces deadlines, and replans ($R_p = 3$) on tool failure.
-- **Tool Gateway** (2 replicas): Manages tool execution, enforces deadlines ($600\text{ms}$), executes tool retries ($R_t = 2$), HTTP transport retries ($R_h = 2$), and circuit breaking.
-- **Data API** (1 replica by default): Knowledge base query service exposing administrative fault injection (`POST /admin/fault`), queueing, and metrics.
-- **PgBouncer & PostgreSQL**: Models physical database connection pool saturation ($C = 25$).
-- **Redis**: Durable workflow metadata and the authoritative per-workflow retry budget.
+- **Agent Orchestrator** (1 replica): planner and supervisor with workflow metadata and retry budgets in Redis.
+- **Tool Gateway** (1 replica): has a 1-second overall tool deadline, nested tool/transport retries, and cancellation forwarding.
+- **Data API** (1 replica): fault-injectable query service with an explicitly labelled finite worker queue.
+- **PgBouncer and PostgreSQL**: provide a real database path and a 25-connection physical pool.
+- **Redis**: stores workflow metadata, retry budget state, and synchronized fault state; it is not described as a durable work queue.
 
-## Metastable Overload Dynamics
+Service readiness is dependency-aware: Data API checks Redis and PgBouncer; the gateway checks Data API and Redis; the orchestrator checks gateway and Redis. Runtime code lives only in `helm/files/` and is loaded into the chart ConfigMap from there.
 
-$$\text{Amplification } A(t) = R_{\text{planner}} \times R_{\text{tool}} \times R_{\text{transport}} = 3 \times 2 \times 2 = 12\times$$
+## Overload dynamics
 
-When transient latency hits the database ($100\text{ms} \rightarrow 1500\text{ms}$ for $10\text{s}$), downstream timeouts trigger cascading retries across all three layers. Arrival rate spikes from $10\text{ req/s}$ to $>100\text{ attempts/s}$, saturating PgBouncer's 25-connection pool and filling Redis backlogs. Once the transient fault is removed, the accumulated backlog and uncoordinated retries sustain the overload indefinitely ($A(t) \gg 1$, $p95 > 5\text{s}$, $Q > 50$).
+A transient backend latency increase can cause caller deadlines to expire. Without cancellation propagation, earlier physical work continues while speculative replanning and nested retries issue replacements. The accumulated Data API queue and orphaned work can sustain overload after the initial disturbance is removed. Mitigation enables cancellation, a retry budget, admission control, and single-attempt retry layers.

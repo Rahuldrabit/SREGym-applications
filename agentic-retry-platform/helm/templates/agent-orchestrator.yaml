@@ -25,13 +25,13 @@ spec:
             - name: PORT
               value: "{{ .Values.agentOrchestrator.port }}"
             - name: TOOL_GATEWAY_URL
-              value: "{{ .Values.agentOrchestrator.toolGatewayUrl }}"
+              value: "http://tool-gateway:{{ .Values.toolGateway.port }}/tools/execute"
             - name: TOOL_GATEWAY_CANCEL_URL
-              value: "http://tool-gateway:8001/tools/cancel"
+              value: "http://tool-gateway:{{ .Values.toolGateway.port }}/tools/cancel"
             - name: REDIS_HOST
-              value: "{{ .Values.agentOrchestrator.redisHost }}"
+              value: "redis"
             - name: REDIS_PORT
-              value: "{{ .Values.agentOrchestrator.redisPort }}"
+              value: "{{ .Values.redis.port }}"
             - name: POLICY_PATH
               value: "/etc/agent-policy/policy.json"
           volumeMounts:
@@ -39,6 +39,13 @@ spec:
               mountPath: /app/agent-orchestrator
             - name: policy-volume
               mountPath: /etc/agent-policy
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.agentOrchestrator.port }}
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            failureThreshold: 10
       volumes:
         - name: code-volume
           configMap:

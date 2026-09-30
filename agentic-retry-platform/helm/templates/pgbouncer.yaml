@@ -39,6 +39,11 @@ spec:
               value: "trust"
           ports:
             - containerPort: {{ .Values.pgbouncer.port }}
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.pgbouncer.port }}
+            initialDelaySeconds: 2
+            periodSeconds: 2
 ---
 apiVersion: v1
 kind: Service

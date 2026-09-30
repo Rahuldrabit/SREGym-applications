@@ -20,6 +20,11 @@ spec:
           imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
           ports:
             - containerPort: {{ .Values.redis.port }}
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.redis.port }}
+            initialDelaySeconds: 1
+            periodSeconds: 2
 ---
 apiVersion: v1
 kind: Service

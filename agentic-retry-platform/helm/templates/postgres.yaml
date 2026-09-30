@@ -29,6 +29,11 @@ spec:
               value: "trust"
           ports:
             - containerPort: {{ .Values.postgres.port }}
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.postgres.port }}
+            initialDelaySeconds: 2
+            periodSeconds: 2
           volumeMounts:
             - name: schema
               mountPath: /docker-entrypoint-initdb.d
