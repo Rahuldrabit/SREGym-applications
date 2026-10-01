@@ -32,8 +32,10 @@ toolGateway:
 dataApi:
   replicaCount: 1
   port: 8002
+  controlPort: 8003
   concurrencyLimit: 25
-  queueCapacity: 200
+  queueCapacity: 40
+  maxRequestHandlers: 64
   normalLatency: 0.10
   faultLatency: 1.50
   resources:

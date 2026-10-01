@@ -27,7 +27,7 @@ spec:
             - name: DATA_API_URL
               value: "http://data-api:{{ .Values.dataApi.port }}/data/query"
             - name: DATA_API_CANCEL_URL
-              value: "http://data-api:{{ .Values.dataApi.port }}/data/cancel"
+              value: "http://data-api:{{ .Values.dataApi.controlPort | default 8003 }}/data/cancel"
             - name: REDIS_HOST
               value: "redis"
             - name: REDIS_PORT

@@ -31,7 +31,7 @@ logger = logging.getLogger("tool-gateway")
 
 PORT = int(os.environ.get("PORT", "8001"))
 DATA_API_URL = os.environ.get("DATA_API_URL", "http://data-api:8002/data/query")
-DATA_API_CANCEL_URL = os.environ.get("DATA_API_CANCEL_URL", "http://data-api:8002/data/cancel")
+DATA_API_CANCEL_URL = os.environ.get("DATA_API_CANCEL_URL", "http://data-api:8003/data/cancel")
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 POLICY_PATH = os.environ.get("POLICY_PATH", "/etc/agent-policy/policy.json")
@@ -251,7 +251,10 @@ class ToolGatewayHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/readyz":
-            data_api_ready_url = DATA_API_URL.rsplit("/data/", 1)[0] + "/readyz"
+            data_api_ready_url = os.environ.get(
+                "DATA_API_READY_URL",
+                DATA_API_CANCEL_URL.rsplit("/data/", 1)[0] + "/readyz",
+            )
             try:
                 with socket.create_connection((REDIS_HOST, REDIS_PORT), timeout=0.5), urllib.request.urlopen(data_api_ready_url, timeout=0.5):
                     pass
